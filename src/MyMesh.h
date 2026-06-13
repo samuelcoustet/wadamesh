@@ -480,8 +480,9 @@ public:
     _ui_trace_ping_tag = tag;
     mesh::Packet* pkt = createTrace(tag, 0, flags);
     if (!pkt) { _ui_trace_ping_tag = 0; return 0; }
-    if (c.out_path_len != OUT_PATH_UNKNOWN && c.out_path_len > 0) {
-      sendDirect(pkt, c.out_path, c.out_path_len);   // walk the full route
+    if (c.out_path_len != OUT_PATH_UNKNOWN && c.out_path_len > 0 &&
+        c.out_path_len <= MAX_PATH_SIZE) {             // clamp: a corrupt out_path_len (>64)
+      sendDirect(pkt, c.out_path, c.out_path_len);   // would overrun sendDirect's payload memcpy -> reboot
     } else {
       uint8_t hash_sz = (uint8_t)(_prefs.path_hash_mode + 1);
       if (hash_sz == 0 || hash_sz > 4) hash_sz = 1;

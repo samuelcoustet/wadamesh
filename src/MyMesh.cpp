@@ -1359,8 +1359,10 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
 #if defined(DISPLAY_CLASS)
   // Diagnostic: log EVERY received frame so we can prove what reaches the
   // radio. Header byte layout is
-  //   [hasXportCodes:1][reserved:1][payload_type:4][route_type:2]
-  // so payload_type = (raw[0]>>2)&0x0F and route_type = raw[0]&0x03.
+  //   [version:2][payload_type:4][route_type:2]   (bits 7..0)
+  // so payload_type = (raw[0]>>2)&0x0F and route_type = raw[0]&0x03. The 4
+  // transport-code bytes follow the header iff route_type is a TRANSPORT_* one
+  // (there is NO "hasXportCodes" bit at 0x80 — that's the top of the version field).
   if (_ui && len > 0) {
     const uint8_t ptype = (raw[0] >> 2) & 0x0F;
     const uint8_t route = raw[0] & 0x03;
@@ -1390,7 +1392,8 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
     // Header is byte 0; transport codes (if present) are 1-4; path_len is
     // next; then path bytes; then payload. We just want the first byte of
     // the payload as dest_hash for TXT/RSP/ACK style packets.
-    const bool has_xport = (raw[0] & 0x80) != 0;
+    const uint8_t rt0 = raw[0] & 0x03;
+    const bool has_xport = (rt0 == ROUTE_TYPE_TRANSPORT_FLOOD || rt0 == ROUTE_TYPE_TRANSPORT_DIRECT);
     int payload_start = 1 + (has_xport ? 4 : 0);
     if (payload_start < len) {
       uint8_t path_byte = raw[payload_start];
@@ -1421,7 +1424,9 @@ void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
   // and bump the matching sent message's count. The fp ring only holds our own
   // recent sends, so other nodes' traffic can't false-match.
   if (len > 0 && isMsgFloodType((raw[0] >> 2) & 0x0F)) {
-    const bool has_xp = (raw[0] & 0x80) != 0;
+    const uint8_t rt  = raw[0] & 0x03;                      // route_type (PH_ROUTE_MASK)
+    const bool has_xp = (rt == ROUTE_TYPE_TRANSPORT_FLOOD || // 4 transport-code bytes follow the
+                         rt == ROUTE_TYPE_TRANSPORT_DIRECT); // header iff route is a TRANSPORT_* one
     const int  ps     = 1 + (has_xp ? 4 : 0);
     if (ps < len) {
       const uint8_t pb   = raw[ps];
