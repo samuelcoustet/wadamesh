@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>wadamesh — a touchscreen for your mesh radio</title>
+<title>WADAMESH — a touchscreen for your mesh radio</title>
 <meta name="description" content="Open-source MeshCore touch-UI firmware for the LilyGo T-Deck and Heltec V4. Map, chat, channels, contacts — install from your browser.">
 <link rel="icon" href="wadamesh-badge.svg">
 <meta name="theme-color" content="#ffffff">
@@ -44,7 +44,8 @@
   .lede{max-width:600px; margin:26px auto 0; color:var(--ink); font-size:clamp(1.1rem,2.5vw,1.5rem); font-weight:600}
   .sub{max-width:560px; margin:12px auto 0; color:var(--mut); font-size:1rem}
   .sub b{color:var(--ink)}
-  .pills{display:flex; flex-wrap:wrap; gap:9px; justify-content:center; margin:28px auto 0; max-width:700px}
+  .pills{display:flex; flex-wrap:nowrap; gap:8px; justify-content:center; margin:28px auto 0; max-width:100%}
+  @media(max-width:720px){.pills{flex-wrap:wrap}}
   .pill{position:relative; display:inline-flex; align-items:center; gap:7px; padding:7px 14px; border:1px solid var(--line);
     border-radius:100px; background:#fff; color:#3a444d; font-size:.86rem; cursor:pointer; transition:border-color .15s, color .15s}
   .pill:hover,.pill:focus,.pill.open{border-color:var(--teal); color:var(--ink); outline:none}
@@ -161,7 +162,7 @@
       <article class="path s" data-path="standalone" tabindex="0">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg></div>
         <h3>Standalone</h3>
-        <p>Just wadamesh — the device boots straight into the touch UI.</p>
+        <p>Just WADAMESH — the device boots straight into the touch UI.</p>
         <div class="good">Best if you want the <b>simplest path</b>: flash once, from your browser, and you're done.</div>
         <span class="pick">Choose standalone <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
       </article>
@@ -169,7 +170,7 @@
       <article class="path l" data-path="launcher" tabindex="0">
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></div>
         <h3>With Launcher</h3>
-        <p>Run wadamesh as one app inside <b>bmorcelli's Launcher</b>.</p>
+        <p>Run WADAMESH as one app inside <b>bmorcelli's Launcher</b>.</p>
         <div class="good">Best if you want to <b>keep multiple firmwares</b> and switch between them from a menu.</div>
         <span class="pick">Choose Launcher <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
       </article>
@@ -182,7 +183,7 @@
       <div class="steps" style="margin-top:22px">
         <div class="step"><div class="num">1</div><div><h4>Connect over USB</h4><p>Plug your T-Deck or Heltec V4 into your computer with a data cable.</p></div></div>
         <div class="step"><div class="num">2</div><div><h4>Pick your board &amp; install</h4><p>Hit <b>Install</b> below, choose the serial port, and let it flash. It does a clean full install.</p></div></div>
-        <div class="step"><div class="num">3</div><div><h4>You're on the mesh</h4><p>The device reboots into wadamesh. Set your name + region in the first-run wizard.</p></div></div>
+        <div class="step"><div class="num">3</div><div><h4>You're on the mesh</h4><p>The device reboots into WADAMESH. Set your name + region in the first-run wizard.</p></div></div>
       </div>
       <div class="boards">
         <div class="board"><h4>Heltec V4 + TFT</h4><p>ESP32-S3 with CHSC6x touch.</p>
@@ -197,11 +198,11 @@
     <div class="guide l" id="g-launcher">
       <button class="back" data-back>← choose a different path</button>
       <div class="guide-head"><h3>Install with bmorcelli's Launcher</h3></div>
-      <p class="p"><a href="https://bmorcelli.github.io/Launcher/" target="_blank" rel="noopener">Launcher</a> is a multi-app boot menu for ESP32 devices — keep it, and run wadamesh as one of your apps.</p>
+      <p class="p"><a href="https://bmorcelli.github.io/Launcher/" target="_blank" rel="noopener">Launcher</a> is a multi-app boot menu for ESP32 devices — keep it, and run WADAMESH as one of your apps.</p>
       <div class="steps" style="margin-top:22px">
         <div class="step"><div class="num">1</div><div><h4>Install Launcher first</h4><p>Flash bmorcelli's Launcher to your device, following its own installer — <a href="https://bmorcelli.github.io/Launcher/" target="_blank" rel="noopener">bmorcelli.github.io/Launcher</a>.</p></div></div>
-        <div class="step"><div class="num">2</div><div><h4>Add the wadamesh app</h4><p>Grab the wadamesh <b>app image</b> for your board below, then install it from Launcher (via its web UI / OTA, or copy the <code>.bin</code> to your SD card).</p></div></div>
-        <div class="step"><div class="num">3</div><div><h4>Launch wadamesh</h4><p>Pick wadamesh from the Launcher menu. Settings persist to SD, so they survive Launcher's slim partition.</p></div></div>
+        <div class="step"><div class="num">2</div><div><h4>Add the WADAMESH app</h4><p>Grab the WADAMESH <b>app image</b> for your board below, then install it from Launcher (via its web UI / OTA, or copy the <code>.bin</code> to your SD card).</p></div></div>
+        <div class="step"><div class="num">3</div><div><h4>Launch WADAMESH</h4><p>Pick WADAMESH from the Launcher menu. Settings persist to SD, so they survive Launcher's slim partition.</p></div></div>
       </div>
       <div class="boards">
         <div class="board"><h4>Heltec V4 + TFT</h4><p>app image (no bootloader)</p>
@@ -209,7 +210,7 @@
         <div class="board"><h4>LilyGo T-Deck / Plus</h4><p>app image (no bootloader)</p>
           <a class="dl" href="https://firmware.wadamesh.com/latest/wadamesh-tdeck.bin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 11l5 5 5-5M5 21h14"/></svg>Download .bin</a></div>
       </div>
-      <p class="hint">New to Launcher? It's the easiest way to try wadamesh without giving up your other firmware — and you can fully switch to Standalone any time.</p>
+      <p class="hint">New to Launcher? It's the easiest way to try WADAMESH without giving up your other firmware — and you can fully switch to Standalone any time.</p>
     </div>
   </div>
 </section>
