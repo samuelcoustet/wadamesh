@@ -183,7 +183,14 @@ bool DataStore::formatFileSystem() {
 #elif defined(RP2040_PLATFORM)
   return LittleFS.format();
 #elif defined(ESP32)
-  bool fs_success = ((fs::SPIFFSFS *)_fs)->format();
+  // Only the internal store is SPIFFS. When useSdStorage() is active, _fs points
+  // at the SD (SDFS) singleton — NOT a SPIFFSFS — so casting it and calling
+  // format() dereferences garbage and crashes. That crash aborted the factory
+  // reset before NVS was erased or the device restarted (everything came back).
+  // On SD the data dir (_root) is wiped by the caller, so here we only format
+  // SPIFFS when it's genuinely the active store.
+  bool fs_success = true;
+  if (_root[0] == '\0') fs_success = ((fs::SPIFFSFS *)_fs)->format();
   esp_err_t nvs_err = nvs_flash_erase(); // no need to reinit, will be done by reboot
   return fs_success && (nvs_err == ESP_OK);
 #else

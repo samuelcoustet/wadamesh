@@ -207,8 +207,8 @@ constexpr uint32_t COLOR_PANEL        = 0x040506;  // essentially black panel
 // Runtime-themeable accent (Settings -> Theme colour). NOT constexpr: the picker
 // rewrites these live and they're reloaded from the saved pref at boot. Every
 // accent site reads them through lv_color_hex(), so one write re-themes the UI.
-uint32_t COLOR_ACCENT       = 0x57585A;  // neutral gray (default)
-uint32_t COLOR_ACCENT_PRESS = 0x3A3B3D;  // darker neutral gray (default)
+uint32_t COLOR_ACCENT       = 0x15B6A6;  // WADAMESH brand teal (default; the logo dots)
+uint32_t COLOR_ACCENT_PRESS = 0x0D766B;  // darker brand teal (default)
 
 // Perceived luminance 0..255 (keep the accent dark enough for off-white text).
 static inline uint32_t accentLuma(uint32_t rgb) {
@@ -5833,23 +5833,14 @@ static void doApplyWifi() {
   wifiConfigSetRadioEnabled(s_pending_wifi_radio_on);
   wifiConfigRequestApply();
 
-  // A reboot is only needed to switch transports: BLE->Wi-Fi (Bluedroid must be
-  // torn down before esp_wifi_init can grab its heap) or Wi-Fi->BLE (BLE only
-  // inits in setup()). When Wi-Fi is already live and stays on, the main loop
-  // re-begins with the new creds (consumeApplyRequest path) — no reboot needed.
-  const bool reboot_needed = !(s_pending_wifi_was_wifi && s_pending_wifi_radio_on);
-  if (!reboot_needed) {
-    if (g_lv.task) g_lv.task->showAlert(TR("Saved — reconnecting\xE2\x80\xA6"), 1600);
-    refreshStatusLabels();
-    return;
-  }
-  if (g_lv.task) {
-    g_lv.task->showAlert(TR("Saved — rebooting"), 1400);
-    g_lv.task->persistHistoryNow();   // persist chat before reboot
-  }
+  // Wi-Fi and BLE coexist now (NimBLE shares the heap with esp_wifi), so the main
+  // loop brings esp_wifi up / down live in response to these prefs — exactly like
+  // the control-center Wi-Fi toggle. No reboot to switch transports any more,
+  // whatever the previous transport was.
+  if (g_lv.task)
+    g_lv.task->showAlert(s_pending_wifi_radio_on ? TR("Saved — reconnecting\xE2\x80\xA6")
+                                                 : TR("Wi-Fi saved (radio off)"), 1600);
   refreshStatusLabels();
-  delay(1500);
-  ESP.restart();
 }
 
 // Forward decl so wifiSlotSaveCb can refresh the modal after writing.
@@ -5858,7 +5849,7 @@ static void buildWifiSettings();
 // Saved Wi-Fi profile slot: tap to load. Fills the SSID/PWD textareas with
 // the stored creds — does NOT auto-apply, so the operator can still tweak
 // (or change their mind by tapping Close) before the main "Save / turn on"
-// commits and reboots.
+// commits (live — no reboot).
 static void wifiSlotLoadCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   intptr_t idx = (intptr_t)lv_event_get_user_data(e);
@@ -5972,20 +5963,11 @@ static void saveWifiCb(lv_event_t* e) {
     s_pending_wifi_radio_on = true;
     lv_obj_add_state(g_set_modal.wifi_sw, LV_STATE_CHECKED);
   }
-  // Capture the live transport now, before doApplyWifi flips any pref. If Wi-Fi
-  // is already up and stays on, saving new creds is a hot reconnect — apply
-  // straight away (the main loop re-begins), no reboot and no confirm to
-  // interrupt. Only a transport switch (to/from BLE) reboots, so keep the
-  // confirm prompt for that case.
-  s_pending_wifi_was_wifi = wifiConfigWantsWifi();
-  if (s_pending_wifi_was_wifi && s_pending_wifi_radio_on) {
-    doApplyWifi();
-    return;
-  }
-  showConfirm(s_pending_wifi_radio_on
-                ? "Save Wi-Fi and reboot? Bluetooth will be turned off."
-                : "Save Wi-Fi (radio off) and reboot?",
-              "Reboot", doApplyWifi);
+  s_pending_wifi_was_wifi = wifiConfigWantsWifi();   // kept for status display; no longer gates a reboot
+  // Wi-Fi + BLE coexist (NimBLE), so applying creds is always a live operation —
+  // the main loop brings the radio up/down with the new settings. No reboot and
+  // no confirm prompt; just save and (re)connect.
+  doApplyWifi();
 }
 #endif
 
@@ -6093,29 +6075,16 @@ static void wifiScanOpenAndKick() {
   s_wifiscan_request = true;
 }
 
-// Switch into Wi-Fi mode (reboot) so a scan can run — WITHOUT needing creds
-// first. Used when the user taps Scan while BLE is the active transport.
-// setRadioEnabled(true) marks Wi-Fi "chosen", so wantsWifi() brings the radio
-// up STA (scannable) on the next boot even with no SSID saved.
-#if defined(MULTI_TRANSPORT_COMPANION)
-static void doSwitchToWifiForScan() {
-  wifiConfigSetRadioEnabled(true);            // marks Wi-Fi chosen -> scannable boot
-  if (g_lv.task) g_lv.task->rebootDevice();   // persists chat history first
-}
-#endif
-
-// "Scan" button -> open the popup + queue a scan on the core-0 worker.
+// "Scan" button -> open the popup + queue a scan on the core-0 worker. If Wi-Fi
+// is off (BLE active), bring the radio up LIVE first — it coexists with NimBLE,
+// no reboot — then scan; the worker brings STA up and lists networks.
 static void wifiScanStartCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 #if defined(MULTI_TRANSPORT_COMPANION)
   if (!wifiConfigWantsWifi()) {
-    // BLE is the active transport — the radio is down, so we can't scan. Offer
-    // to switch to Wi-Fi (reboots; comes up scannable even with no creds) so
-    // the user doesn't have to type an SSID blind.
-    showConfirm("Wi-Fi is off (Bluetooth is on). Switch to Wi-Fi and reboot so "
-                "you can scan and pick a network?",
-                "Switch", doSwitchToWifiForScan);
-    return;
+    wifiConfigSetRadioEnabled(true);   // wantsWifi() now true -> the scan worker can bring STA up
+    wifiConfigRequestApply();          // main loop brings esp_wifi up live (no reboot)
+    if (g_lv.task) g_lv.task->showAlert(TR("Wi-Fi on, scanning\xE2\x80\xA6"), 1200);
   }
   wifiScanOpenAndKick();
 #endif
@@ -6205,9 +6174,7 @@ static void buildWifiSettings() {
     lv_textarea_set_text(g_set_modal.wifi_pwd_ta, pwd_buf);
   }
 
-  // No inline reboot hint — saveWifiCb shows a confirmation popup with the
-  // full explanation when the user actually presses Save. Keeps the page
-  // short enough that the button stays visible above the fold.
+  // Save applies live (Wi-Fi + BLE coexist) — no reboot, no confirm popup.
   lv_obj_t* b_save = lv_btn_create(body);
   lv_obj_set_size(b_save, lv_pct(100),36);
   lv_obj_set_pos(b_save, 2, y);
@@ -9977,17 +9944,25 @@ static void fmRmRecursive(fs::FS* fs, const char* path) {
   File d = fs->open(path);
   const bool isdir = d && d.isDirectory();
   if (isdir) {
-    File e = d.openNextFile();
-    while (e) {
+    // Delete one child per pass, rewinding the directory after each removal.
+    // Removing entries during a single openNextFile() walk invalidates the FatFS
+    // read cursor and silently skips entries — which left files behind on a
+    // recursive delete / factory reset. Rewinding re-reads from the top each pass
+    // (O(n^2), fine for these tiny trees) so every child is actually removed.
+    for (;;) {
+      File e = d.openNextFile();
+      if (!e) break;
       const char* full = e.name();
       const char* base = strrchr(full, '/');
       base = base ? base + 1 : full;
       const bool cdir = e.isDirectory();
       char child[200];
-      if (base[0]) snprintf(child, sizeof child, "%s/%s", path, base);
+      const bool have = (base[0] != '\0');
+      if (have) snprintf(child, sizeof child, "%s/%s", path, base);
       e.close();
-      if (base[0]) { if (cdir) fmRmRecursive(fs, child); else fs->remove(child); }
-      e = d.openNextFile();
+      if (!have) break;                 // nameless entry — don't spin forever
+      if (cdir) fmRmRecursive(fs, child); else fs->remove(child);
+      d.rewindDirectory();
     }
     d.close();
     fs->rmdir(path);
@@ -11904,6 +11879,30 @@ static int verchkFetchLatest(WiFiClient& client, HTTPClient& http) {
   return best;
 }
 
+// Watchdog-safe Wi-Fi scan. Starts an ASYNC scan and polls to completion with
+// vTaskDelay yields + a hard time cap, so the calling task never blocks long
+// enough to starve an idle task / the 5 s task watchdog. Replaces the old
+// pattern of two back-to-back *synchronous* scans (~8 s total) with a
+// WiFi.disconnect() wedged between them — which, with no AP present (Wi-Fi on
+// but no SSID connected), always ran BOTH passes and tripped the task watchdog
+// -> panic reboot. Returns the AP count (0 on none/failure/timeout); read
+// results with WiFi.SSID(i).
+static int wifiScanWatchdogSafe(uint32_t cap_ms) {
+  WiFi.scanDelete();
+  if (WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/true, /*passive=*/false,
+                        /*max_ms_per_chan=*/300, /*channel=*/0) == WIFI_SCAN_FAILED) {
+    return 0;
+  }
+  const uint32_t deadline = millis() + cap_ms;
+  for (;;) {
+    const int16_t st = WiFi.scanComplete();   // >=0 = AP count, -1 running, -2 failed
+    if (st >= 0)                return st;
+    if (st == WIFI_SCAN_FAILED) return 0;
+    if ((int32_t)(millis() - deadline) > 0) { WiFi.scanDelete(); return 0; }
+    vTaskDelay(pdMS_TO_TICKS(50));            // yield -> IDLE runs -> feeds the task watchdog
+  }
+}
+
 static void tileFetchTaskFn(void* arg) {
   (void)arg;
   // Plain HTTP, not HTTPS. We can't do HTTPS on this device: mbedTLS
@@ -11985,12 +11984,10 @@ static void tileFetchTaskFn(void* arg) {
       }
       if ((WiFi.getMode() & WIFI_MODE_STA) == 0) { WiFi.mode(WIFI_STA); vTaskDelay(pdMS_TO_TICKS(180)); }
       else                                        { vTaskDelay(pdMS_TO_TICKS(40)); }
-      WiFi.scanDelete();
-      int found = WiFi.scanNetworks(false, true, false, 300, 0);   // sync, show-hidden, active
-      if (found <= 0 && WiFi.status() != WL_CONNECTED) {
-        WiFi.disconnect(false, false); vTaskDelay(pdMS_TO_TICKS(120));
-        found = WiFi.scanNetworks(false, true, false, 300, 0);
-      }
+      // Watchdog-safe: one bounded, yielding async pass (see wifiScanWatchdogSafe).
+      // Never the old twin 4 s sync scans + mid-scan WiFi.disconnect() that
+      // panicked (task watchdog) when no AP was present — Wi-Fi on, no SSID.
+      int found = wifiScanWatchdogSafe(8000);
       int n = 0;
       for (int idx = 0; idx < found && n < kWifiScanMax; ++idx) {
         String s = WiFi.SSID(idx);
@@ -16560,19 +16557,33 @@ static void factoryWipeSdData() {
   if (!fmSdTryMount()) return;
   File d = SD.open("/meshcomod");
   if (!d || !d.isDirectory()) { if (d) d.close(); return; }
+  // Collect the entries to wipe FIRST, then delete. Removing during the
+  // openNextFile() walk skips entries on FatFS — a partial wipe is what left
+  // data behind after a factory reset. Keep /meshcomod/tiles (cached map tiles).
+  static const int kMax = 24;
+  char names[kMax][48];
+  bool dirs[kMax];
+  int n = 0;
   File e = d.openNextFile();
-  while (e) {
+  while (e && n < kMax) {
     const char* full = e.name();
     const char* base = strrchr(full, '/'); base = base ? base + 1 : full;
-    const bool isdir = e.isDirectory();
-    const bool keep  = (base[0] == '\0') || !strcasecmp(base, "tiles");
-    char child[200];
-    if (!keep) snprintf(child, sizeof child, "/meshcomod/%s", base);
+    if (base[0] && strcasecmp(base, "tiles") != 0) {
+      strncpy(names[n], base, sizeof(names[n]) - 1);
+      names[n][sizeof(names[n]) - 1] = '\0';
+      dirs[n] = e.isDirectory();
+      ++n;
+    }
     e.close();
-    if (!keep) { if (isdir) fmRmRecursive(&SD, child); else SD.remove(child); }
     e = d.openNextFile();
   }
+  if (e) e.close();
   d.close();
+  for (int i = 0; i < n; ++i) {
+    char child[200];
+    snprintf(child, sizeof child, "/meshcomod/%s", names[i]);
+    if (dirs[i]) fmRmRecursive(&SD, child); else SD.remove(child);
+  }
 }
 #endif
 
@@ -17677,7 +17688,7 @@ static void buildGlobalStatusBar() {
   // Left zone — dynamic per-tab. Default to "MESHCOMOD"; updateGlobal-
   // StatusBar() swaps to the envelope+count on non-home tabs.
   g_statusbar.left_label = lv_label_create(g_statusbar.root);
-  lv_label_set_text(g_statusbar.left_label, TR("MESHCOMOD"));
+  lv_label_set_text(g_statusbar.left_label, TR("WADAMESH"));
   lv_obj_set_style_text_color(g_statusbar.left_label, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_set_style_text_font(g_statusbar.left_label, &g_font_14, LV_PART_MAIN);
   lv_obj_align(g_statusbar.left_label, LV_ALIGN_LEFT_MID, 6, 0);
@@ -17786,7 +17797,7 @@ static void updateGlobalStatusBar() {
       // On the immersive map the left zone carries the required OSM attribution.
       lv_label_set_text(g_statusbar.left_label, TR("\xC2\xA9 OpenStreetMap"));
     } else if (tab == 0) {
-      lv_label_set_text(g_statusbar.left_label, TR("MESHCOMOD"));
+      lv_label_set_text(g_statusbar.left_label, TR("WADAMESH"));
     } else {
       int total_unread = g_lv.task->getUnreadTotal();
       if (total_unread > 0) {
@@ -18019,16 +18030,15 @@ static void refreshStatusLabels() {
 // ============================================================
 static lv_obj_t* s_splash_root = nullptr;
 
+// WADAMESH mesh-mark artwork (native 140x84): two zig-zag strokes + 7 dots — the
+// brand logo. Static so the lv_line point-array pointers stay valid for the life
+// of the splash (lv_line keeps the pointer; it does not copy the points).
+static const lv_point_t s_wmark_top[5]  = {{0,42},{35,0},{70,42},{105,0},{140,42}};
+static const lv_point_t s_wmark_bot[5]  = {{0,42},{35,84},{70,42},{105,84},{140,42}};
+static const lv_point_t s_wmark_dots[7] = {{0,42},{70,42},{140,42},{35,0},{105,0},{35,84},{105,84}};
+
 static void splashSetOpa(void* var, int32_t v) {
   lv_obj_set_style_opa(static_cast<lv_obj_t*>(var), static_cast<lv_opa_t>(v), LV_PART_MAIN);
-}
-
-static void splashSetX(void* var, int32_t v) {
-  lv_obj_set_x(static_cast<lv_obj_t*>(var), static_cast<lv_coord_t>(v));
-}
-
-static void splashSetWidth(void* var, int32_t v) {
-  lv_obj_set_width(static_cast<lv_obj_t*>(var), static_cast<lv_coord_t>(v));
 }
 
 static void splashRemove() {
@@ -18079,93 +18089,91 @@ static void buildBootSplash() {
   lv_obj_move_foreground(s_splash_root);
   lv_obj_add_event_cb(s_splash_root, splashTapDismissCb, LV_EVENT_CLICKED, nullptr);
 
-  // ---- Title: TOUCH BETA ----
-  // The bootloader/early-boot screen already paints the pixelated
-  // "MESHCOMOD" wordmark; this second beat names the build channel
-  // (TOUCH BETA). Short, white on black, fades up identical to the
-  // previous wordmark animation — feels like the next beat of the boot
-  // sequence rather than a brand splash.
-  lv_obj_t* title = lv_label_create(s_splash_root);
-  lv_label_set_text(title, TR("TOUCH BETA"));
-  // UNSCII_16 is a 16-pixel-tall bitmap font — same pixelated style as
-  // the bootloader's MESHCOMOD wordmark, so the splash reads as a
-  // continuation of the boot screen instead of a re-styled "designed"
-  // overlay.
-  lv_obj_set_style_text_font(title, &lv_font_unscii_16, LV_PART_MAIN);
-  lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_set_style_text_letter_space(title, 3, LV_PART_MAIN);
-  lv_obj_align(title, LV_ALIGN_CENTER, 0, -16);
-  lv_obj_set_style_opa(title, LV_OPA_TRANSP, LV_PART_MAIN);
+  // ---- WADAMESH logo: the mesh mark (teal dots) + the wordmark ----
+  // The pre-LVGL boot window paints the plain "WADAMESH" wordmark; this beat
+  // shows the brand logo in full colour — the mesh strokes with the teal dots —
+  // then names the build channel beneath. Fades up as the next boot beat.
 
-  // ---- Underline ----
-  lv_obj_t* rule = lv_obj_create(s_splash_root);
-  lv_obj_remove_style_all(rule);
-  lv_obj_set_size(rule, 0, 2);
-  lv_obj_align(rule, LV_ALIGN_CENTER, 0, 14);
-  lv_obj_set_style_bg_color(rule, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-  lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, LV_PART_MAIN);
-  lv_obj_set_style_radius(rule, 1, LV_PART_MAIN);
+  // Mesh mark: two zig-zag strokes (off-white) + 7 brand-teal dots. Native
+  // artwork is 140x84; it sits in a 160x100 box (a ~10px margin) so the dots
+  // that overhang the stroke vertices aren't clipped at the container edge.
+  lv_obj_t* mark = lv_obj_create(s_splash_root);
+  lv_obj_remove_style_all(mark);
+  lv_obj_set_size(mark, 160, 100);
+  lv_obj_align(mark, LV_ALIGN_CENTER, 0, 0);   // dead-centre; matches the pre-LVGL mark
+  lv_obj_clear_flag(mark, LV_OBJ_FLAG_SCROLLABLE);
+  // Full opacity from the first painted frame (NOT faded in): the pre-LVGL boot
+  // screen already shows this exact mark in white at the same position, so the
+  // splash's first frame must land the colour mark in-place — only the dots flip
+  // white->teal. Fading the mark up from black is what flashed between the two.
+  lv_obj_set_style_opa(mark, LV_OPA_COVER, LV_PART_MAIN);
+  for (int li = 0; li < 2; ++li) {
+    lv_obj_t* ln = lv_line_create(mark);
+    lv_line_set_points(ln, li ? s_wmark_bot : s_wmark_top, 5);
+    lv_obj_set_pos(ln, 10, 8);
+    lv_obj_set_style_pad_all(ln, 0, LV_PART_MAIN);
+    lv_obj_set_style_line_width(ln, 5, LV_PART_MAIN);
+    lv_obj_set_style_line_color(ln, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_set_style_line_rounded(ln, true, LV_PART_MAIN);
+  }
+  for (int di = 0; di < 7; ++di) {
+    lv_obj_t* dot = lv_obj_create(mark);
+    lv_obj_remove_style_all(dot);
+    lv_obj_set_size(dot, 13, 13);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(dot, lv_color_hex(0x15B6A6), LV_PART_MAIN);  // brand teal
+    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_pos(dot, s_wmark_dots[di].x + 4, s_wmark_dots[di].y + 2);   // centre the 13px dot on the vertex
+  }
 
-  // ---- Subtitle ----
-  // Matches the "ON-NET" title: announces the link is live. Spaced
-  // letters keep it visually quiet under the bigger wordmark.
+  // Wordmark: "WADA" off-white, "MESH" in brand teal (label recolor). UNSCII_16
+  // keeps the pixel/mono feel as a continuation of the early boot screen.
+  lv_obj_t* wm = lv_label_create(s_splash_root);
+  lv_label_set_recolor(wm, true);
+  lv_label_set_text(wm, "WADA#15B6A6 MESH#");
+  lv_obj_set_style_text_font(wm, &lv_font_unscii_16, LV_PART_MAIN);
+  lv_obj_set_style_text_color(wm, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+  lv_obj_set_style_text_letter_space(wm, 3, LV_PART_MAIN);
+  lv_obj_align(wm, LV_ALIGN_CENTER, 0, 60);   // below the now-centred mark
+  lv_obj_set_style_opa(wm, LV_OPA_TRANSP, LV_PART_MAIN);
+
+  // ---- Subtitle: build channel ----
   lv_obj_t* sub = lv_label_create(s_splash_root);
-  lv_label_set_text(sub, TR("mesh  link  armed"));
-  // UNSCII_8 keeps the pixelated boot-screen feel; Montserrat would
-  // break the visual continuity with the title.
+  lv_label_set_text(sub, TR("TOUCH BETA"));
   lv_obj_set_style_text_font(sub, &lv_font_unscii_8, LV_PART_MAIN);
   lv_obj_set_style_text_color(sub, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_letter_space(sub, 4, LV_PART_MAIN);
-  lv_obj_align(sub, LV_ALIGN_CENTER, 0, 32);
+  lv_obj_align(sub, LV_ALIGN_CENTER, 0, 82);
   lv_obj_set_style_opa(sub, LV_OPA_TRANSP, LV_PART_MAIN);
 
-  // Phase 1: title fades in while sliding up from y=-6 to y=-16.
-  lv_anim_t a;
-  lv_anim_init(&a);
-  lv_anim_set_var(&a, title);
-  lv_anim_set_time(&a, 550);
-  lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);
-  lv_anim_set_exec_cb(&a, splashSetOpa);
-  lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-  lv_anim_start(&a);
+  // (No mark fade — it's shown at full opacity above, replacing the identical
+  // white pre-LVGL mark in-place so there's no flash at the hand-off.)
 
-  // Phase 2: underline grows outward from the center over 500ms (180px wide).
+  // Phase 2: the wordmark fades in, slightly delayed.
   lv_anim_t aw;
   lv_anim_init(&aw);
-  lv_anim_set_var(&aw, rule);
-  lv_anim_set_time(&aw, 500);
-  lv_anim_set_delay(&aw, 250);
-  lv_anim_set_values(&aw, 0, 180);
-  lv_anim_set_exec_cb(&aw, splashSetWidth);
+  lv_anim_set_var(&aw, wm);
+  lv_anim_set_time(&aw, 450);
+  lv_anim_set_delay(&aw, 300);
+  lv_anim_set_values(&aw, LV_OPA_TRANSP, LV_OPA_COVER);
+  lv_anim_set_exec_cb(&aw, splashSetOpa);
   lv_anim_set_path_cb(&aw, lv_anim_path_ease_out);
   lv_anim_start(&aw);
-  // Centering doesn't auto-update with width on lv_obj_create; keep the rule
-  // centered by sliding x in lockstep with the width grow.
-  lv_anim_t ax;
-  lv_anim_init(&ax);
-  lv_anim_set_var(&ax, rule);
-  lv_anim_set_time(&ax, 500);
-  lv_anim_set_delay(&ax, 250);
-  lv_anim_set_values(&ax, 120, 120 - 90);  // (240-w)/2 across the grow
-  lv_anim_set_exec_cb(&ax, splashSetX);
-  lv_anim_set_path_cb(&ax, lv_anim_path_ease_out);
-  lv_anim_start(&ax);
 
-  // Phase 3: subtitle fades in slightly delayed.
+  // Phase 3: subtitle fades in last.
   lv_anim_t as;
   lv_anim_init(&as);
   lv_anim_set_var(&as, sub);
   lv_anim_set_time(&as, 450);
-  lv_anim_set_delay(&as, 500);
+  lv_anim_set_delay(&as, 600);
   lv_anim_set_values(&as, LV_OPA_TRANSP, LV_OPA_70);
   lv_anim_set_exec_cb(&as, splashSetOpa);
   lv_anim_set_path_cb(&as, lv_anim_path_ease_out);
   lv_anim_start(&as);
 
-  // Hold for ~1.5 s after the last fade-in completes (subtitle ends at
-  // t=950 ms, fade-out starts at t=2400), then trigger fade-out. Earlier
-  // 1100 ms timer made the splash feel rushed — the operator barely got
-  // to read "ON-NET" before it dismissed.
+  // Hold after the last fade-in completes (subtitle ends at ~t=1050 ms,
+  // fade-out starts at t=2400), then trigger fade-out. A shorter timer made
+  // the splash feel rushed — barely time to register the logo before dismiss.
   lv_timer_t* t = lv_timer_create(splashHoldThenFadeOut, 2400, nullptr);
   lv_timer_set_repeat_count(t, 1);
 }
@@ -18558,16 +18566,17 @@ static void touchThemeApplyCb(lv_theme_t* /*th*/, lv_obj_t* obj) {
 }
 static lv_theme_t s_touch_theme;   // our wrapper theme (parent = stock default)
 
-// Curated accent palette for the swatch grid: stock grey + a colour spread.
+// Curated accent palette for the swatch grid: WADAMESH brand teal (default,
+// the logo dots) first, then stock grey + a colour spread.
 static const uint32_t kThemeColors[] = {
-  0x57585A, 0x3B82F6, 0x2DA8A0, 0x3FA34D, 0x8B5CF6, 0xD2569E,
-  0xD0524A, 0xE0823C, 0xC8A030, 0x5B6BD0, 0x4AB0C8, 0xA85AB0,
+  0x15B6A6, 0x57585A, 0x3B82F6, 0x2DA8A0, 0x3FA34D, 0x8B5CF6,
+  0xD2569E, 0xD0524A, 0xE0823C, 0xC8A030, 0x5B6BD0, 0xA85AB0,
 };
 
 static lv_obj_t* s_accent_picker  = nullptr;
 static lv_obj_t* s_accent_hex_ta  = nullptr;
 static lv_obj_t* s_accent_preview = nullptr;
-static uint32_t  s_accent_sel     = 0x57585Au;   // currently-selected colour
+static uint32_t  s_accent_sel     = 0x15B6A6u;   // currently-selected colour (default: brand teal)
 static bool      s_accent_syncing = false;
 
 static void accentPreviewShow(uint32_t rgb) {
@@ -18625,7 +18634,7 @@ static void accentSaveCb(lv_event_t* e) {
   if (g_lv.task) g_lv.task->rebootDevice();   // saves chat history first
 }
 static void accentResetCb(lv_event_t* e) {
-  if (lv_event_get_code(e) == LV_EVENT_CLICKED) accentSetSelection(0x57585Au, true);
+  if (lv_event_get_code(e) == LV_EVENT_CLICKED) accentSetSelection(0x15B6A6u, true);
 }
 static void openAccentPicker() {
   accentPickerClose();

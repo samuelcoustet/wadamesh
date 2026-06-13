@@ -196,6 +196,30 @@ static SyncDebugCounters g_sync_dbg = {0, 0, 0, 0, 0, 0};
 #define MESHCOMOD_WIFI_SCAN_MAX 12
 static char s_meshcomod_scan_ssids[MESHCOMOD_WIFI_SCAN_MAX][WIFI_CONFIG_SSID_MAX];
 static int s_meshcomod_scan_count = 0;
+
+// Watchdog-safe Wi-Fi scan. Starts an ASYNC scan and polls to completion with
+// vTaskDelay yields + a hard time cap, so the calling task never blocks long
+// enough to starve an idle task / the 5 s task watchdog. Replaces the old
+// pattern of two back-to-back *synchronous* scans (~8 s total) with a
+// WiFi.disconnect() wedged between them — which, with no AP present (Wi-Fi on
+// but no SSID connected), always ran BOTH passes and tripped the task watchdog
+// -> panic reboot. Returns the AP count (0 on none/failure/timeout); read
+// results with WiFi.SSID(i).
+static int wifiScanWatchdogSafe(uint32_t cap_ms) {
+  WiFi.scanDelete();
+  if (WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/true, /*passive=*/false,
+                        /*max_ms_per_chan=*/300, /*channel=*/0) == WIFI_SCAN_FAILED) {
+    return 0;
+  }
+  const uint32_t deadline = millis() + cap_ms;
+  for (;;) {
+    const int16_t st = WiFi.scanComplete();   // >=0 = AP count, -1 running, -2 failed
+    if (st >= 0)                return st;
+    if (st == WIFI_SCAN_FAILED) return 0;
+    if ((int32_t)(millis() - deadline) > 0) { WiFi.scanDelete(); return 0; }
+    vTaskDelay(pdMS_TO_TICKS(50));            // yield -> IDLE runs -> feeds the task watchdog
+  }
+}
 #endif
 #endif
 static const char* kMeshcomodHelpMsg =
@@ -854,15 +878,11 @@ bool MyMesh::handleMeshcomodCommand(const char* text, int text_len) {
     } else {
       delay(40);
     }
-    WiFi.scanDelete();
     s_meshcomod_scan_count = 0;
-    int found = WiFi.scanNetworks(false, true, false, 300, 0);
-    // On some ESP32 states, first scan right after STA bring-up can fail when not connected.
-    if (found <= 0 && WiFi.status() != WL_CONNECTED) {
-      WiFi.disconnect(false, false);
-      delay(120);
-      found = WiFi.scanNetworks(false, true, false, 300, 0);
-    }
+    // Watchdog-safe: one bounded, yielding async pass (see wifiScanWatchdogSafe).
+    // This handler runs on the main/loop task, so the old twin synchronous scans
+    // (~8 s) could starve the task watchdog with no AP present and panic-reboot.
+    int found = wifiScanWatchdogSafe(8000);
     if (found <= 0) {
       pushMeshcomodReply("scan: no networks (2.4GHz only)");
       WiFi.scanDelete();

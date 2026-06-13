@@ -352,10 +352,10 @@ bool touchPrefsSetAccentPopups(bool on) {
 }
 
 // UI accent colour (buttons, active tab, keyboard, highlights) as 0xRRGGBB.
-// Default = the stock neutral gray. The picker clamps it dark enough that the
-// off-white button text stays readable on any hue.
+// Default = the WADAMESH brand teal (the logo dots). The picker clamps it dark
+// enough that the off-white button text stays readable on any hue.
 static const char* KEY_ACCENT = "accent";
-static const uint32_t DEFAULT_ACCENT = 0x57585Au;
+static const uint32_t DEFAULT_ACCENT = 0x15B6A6u;
 uint32_t touchPrefsGetAccentColor() {
   if (!s_begun) touchPrefsBegin();
   return s_prefs.getUInt(KEY_ACCENT, DEFAULT_ACCENT) & 0xFFFFFFu;

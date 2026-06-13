@@ -9,6 +9,7 @@
 #include <helpers/TouchDiagTrace.h>
 #include <helpers/MeshTouchTxTrace.h>
 #include <helpers/esp32/TouchPrefsStore.h>   // touchPrefsGetUiRotation for the boot wordmark
+#include "wadamesh_mark_rgb.h"               // anti-aliased mesh-mark (RGB565) for the pre-LVGL boot screen
 #endif
 
 // Believe it or not, this std C function is busted on some platforms!
@@ -198,13 +199,18 @@ void setup() {
       else if (r == 3) display.setDisplayRotation(3);
     }
 #endif
-    disp->startFrame();
-    // Centered MESHCOMOD title so the pre-LVGL boot window looks like the
-    // product, not a debug screen. Size 2 fits comfortably in 240 px (size 3
-    // wraps the trailing "D" because the Adafruit GFX font has no kerning).
-    disp->setTextSize(2);
-    disp->drawTextCentered(disp->width() / 2, disp->height() / 2 - 8, "MESHCOMOD");
-    disp->endFrame();
+    // Paint the WADAMESH mesh mark the instant the panel is up, so the logo is on
+    // screen from power-on — before LVGL is ready. Blitted as an anti-aliased
+    // RGB565 bitmap via the full-res LVGL path (writePixelsRGB565), so the
+    // diagonals are smooth, not 1-bit jagged. White-on-black here; the teal dots
+    // arrive with the LVGL splash. Centred exactly: the artwork is centred within
+    // the bitmap, and the colour splash mark is centred to the same point, so the
+    // hand-off stays in place.
+    display.startFrame();
+    display.writePixelsRGB565((display.width()  - WADAMESH_MARK_W) / 2,
+                              (display.height() - WADAMESH_MARK_H) / 2,
+                              WADAMESH_MARK_W, WADAMESH_MARK_H, WADAMESH_MARK_RGB565);
+    display.endFrame();
   }
 #endif
 
