@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wadamesh — a touchscreen for your mesh radio</title>
+<meta name="description" content="Open-source MeshCore touch-UI firmware for the LilyGo T-Deck and Heltec V4. Map, chat, channels, contacts — install from your browser.">
+<script>
+  // Web Serial needs a secure context; "Always Use HTTPS" is off zone-wide for
+  // the firmware's HTTP fetches, so self-upgrade just this page.
+  if (location.protocol === 'http:') location.replace(location.href.replace(/^http:/, 'https:'));
+</script>
+<script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+<style>
+  :root{
+    --bg:#070b11; --ink:#e8eef5; --mut:#8a98a8; --line:#1b2632;
+    --card:#0e1722; --card2:#101d2b; --accent:#4aa3ff; --accent2:#37e0c7;
+    color-scheme:dark;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Inter,sans-serif;
+    background:var(--bg); color:var(--ink); overflow-x:hidden;
+  }
+  /* ambient mesh glow */
+  body::before{
+    content:""; position:fixed; inset:-20% -20% auto -20%; height:80vh; z-index:-1;
+    background:
+      radial-gradient(48vw 40vh at 22% 8%, rgba(74,163,255,.20), transparent 60%),
+      radial-gradient(42vw 38vh at 82% 0%, rgba(55,224,199,.14), transparent 60%);
+    filter:saturate(120%);
+  }
+  .mesh{position:fixed; inset:0; z-index:-2; opacity:.5}
+  a{color:var(--accent); text-decoration:none}
+  .wrap{max-width:1040px; margin:0 auto; padding:0 22px}
+
+  /* ---- hero ---- */
+  header{padding:84px 0 28px; text-align:center}
+  .logo{font-size:clamp(2.6rem,8vw,4.6rem); font-weight:800; letter-spacing:-1.5px; line-height:1}
+  .logo .dot{color:var(--accent)}
+  .kicker{display:inline-block; margin-bottom:18px; padding:6px 13px; border:1px solid var(--line);
+    border-radius:100px; color:var(--mut); font-size:.8rem; letter-spacing:.04em; text-transform:uppercase}
+  .lede{max-width:620px; margin:18px auto 0; color:#c7d2dd; font-size:clamp(1.05rem,2.4vw,1.35rem)}
+  .sub{max-width:560px; margin:12px auto 0; color:var(--mut); font-size:.98rem}
+  .pills{display:flex; flex-wrap:wrap; gap:9px; justify-content:center; margin:26px auto 0; max-width:680px}
+  .pill{display:inline-flex; align-items:center; gap:7px; padding:7px 13px; border:1px solid var(--line);
+    border-radius:100px; background:rgba(255,255,255,.02); color:#bcc8d4; font-size:.86rem}
+  .pill svg{width:15px;height:15px;color:var(--accent)}
+  .cue{margin-top:38px; color:var(--mut); font-size:.85rem; animation:bob 2.2s ease-in-out infinite}
+  @keyframes bob{0%,100%{transform:translateY(0)}50%{transform:translateY(6px)}}
+
+  /* ---- journey ---- */
+  section{padding:42px 0}
+  .h2{font-size:clamp(1.5rem,4vw,2.1rem); font-weight:750; letter-spacing:-.5px; text-align:center}
+  .h2 + .p{color:var(--mut); text-align:center; max-width:560px; margin:10px auto 0}
+
+  .paths{display:grid; gap:18px; grid-template-columns:1fr 1fr; margin-top:34px}
+  @media(max-width:680px){.paths{grid-template-columns:1fr}}
+  .path{
+    position:relative; text-align:left; cursor:pointer; border:1px solid var(--line);
+    background:linear-gradient(180deg,var(--card2),var(--card)); border-radius:18px; padding:26px;
+    transition:transform .18s ease, border-color .18s ease, box-shadow .18s ease;
+  }
+  .path:hover{transform:translateY(-3px); border-color:#2c455f; box-shadow:0 16px 40px -20px rgba(74,163,255,.5)}
+  .path.sel{border-color:var(--accent); box-shadow:0 0 0 1px var(--accent), 0 18px 50px -24px rgba(74,163,255,.7)}
+  .path .ic{width:46px;height:46px;border-radius:12px;display:grid;place-items:center;
+    background:rgba(74,163,255,.12); color:var(--accent); margin-bottom:16px}
+  .path .ic svg{width:24px;height:24px}
+  .path.l .ic{background:rgba(55,224,199,.12); color:var(--accent2)}
+  .path h3{font-size:1.25rem; margin-bottom:6px}
+  .path .tag{position:absolute; top:20px; right:20px; font-size:.7rem; letter-spacing:.05em;
+    text-transform:uppercase; color:var(--accent); border:1px solid #21456a; padding:4px 9px; border-radius:100px}
+  .path p{color:var(--mut); font-size:.95rem}
+  .path .good{margin-top:14px; color:#aeb9c5; font-size:.86rem}
+  .path .good b{color:var(--ink)}
+  .path .pick{margin-top:18px; display:inline-flex; align-items:center; gap:8px; font-weight:650; color:var(--ink)}
+  .path .pick svg{width:16px;height:16px; transition:transform .18s ease}
+  .path:hover .pick svg{transform:translateX(4px)}
+
+  /* ---- guide panels ---- */
+  .guide{display:none; margin-top:30px; animation:rise .4s ease both}
+  .guide.show{display:block}
+  @keyframes rise{from{opacity:0; transform:translateY(14px)}to{opacity:1; transform:none}}
+  .guide-head{display:flex; align-items:center; gap:12px; justify-content:center; margin-bottom:6px}
+  .guide-head h3{font-size:1.35rem}
+  .back{display:block; margin:0 auto 22px; color:var(--mut); background:none; border:0; cursor:pointer; font-size:.9rem}
+  .back:hover{color:var(--ink)}
+
+  .steps{display:grid; gap:14px; max-width:760px; margin:0 auto}
+  .step{display:flex; gap:16px; align-items:flex-start; border:1px solid var(--line);
+    background:var(--card); border-radius:14px; padding:18px 20px}
+  .num{flex:none; width:30px;height:30px;border-radius:50%; display:grid;place-items:center; font-weight:700;
+    background:var(--accent); color:#06101c}
+  .l .num{background:var(--accent2)}
+  .step h4{font-size:1.02rem; margin-bottom:3px}
+  .step p{color:var(--mut); font-size:.92rem}
+  .step code{background:#0a1019; border:1px solid var(--line); border-radius:6px; padding:1px 6px; font-size:.85em}
+
+  .boards{display:grid; gap:14px; grid-template-columns:1fr 1fr; max-width:760px; margin:8px auto 0}
+  @media(max-width:560px){.boards{grid-template-columns:1fr}}
+  .board{border:1px solid var(--line); background:var(--card); border-radius:14px; padding:18px; display:flex;
+    flex-direction:column; gap:10px; align-items:flex-start}
+  .board h4{font-size:1.02rem}
+  .board p{color:var(--mut); font-size:.86rem}
+  esp-web-install-button{--esp-tools-button-color:#fff;--esp-tools-button-text-color:#06101c}
+  .dl{display:inline-flex;align-items:center;gap:8px;background:var(--accent2);color:#04130f;border-radius:9px;
+    padding:9px 15px;font-weight:650;font-size:.9rem}
+  .dl svg{width:15px;height:15px}
+  .hint{max-width:760px;margin:18px auto 0;color:var(--mut);font-size:.86rem;text-align:center}
+  .noserial{display:none;color:#ffb454;text-align:center;margin-top:14px}
+  body.no-serial .noserial{display:block}
+
+  footer{border-top:1px solid var(--line); margin-top:48px; padding:30px 0 56px; text-align:center; color:var(--mut); font-size:.88rem}
+  footer a{color:#9fb0c0}
+</style>
+</head>
+<body>
+<canvas class="mesh"></canvas>
+
+<header>
+  <div class="wrap">
+    <span class="kicker">open-source · GPL-3.0</span>
+    <h1 class="logo">wada<span class="dot">·</span>mesh</h1>
+    <p class="lede">A real touchscreen UI for your mesh radio.</p>
+    <p class="sub">MeshCore firmware for the <b>LilyGo&nbsp;T-Deck</b> and <b>Heltec&nbsp;V4</b> — map, chat, channels and contacts, on the device itself.</p>
+    <div class="pills">
+      <span class="pill"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 20l-6-3V4l6 3 6-3 6 3v13l-6-3-6 3z"/><path d="M9 7v13M15 4v13"/></svg>Offline map</span>
+      <span class="pill"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>Chat &amp; channels</span>
+      <span class="pill"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>Contacts</span>
+      <span class="pill"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12h20M12 2a15 15 0 0 1 0 20M12 2a15 15 0 0 0 0 20"/><circle cx="12" cy="12" r="10"/></svg>11 languages</span>
+    </div>
+    <div class="cue">↓ &nbsp;get it on your device</div>
+  </div>
+</header>
+
+<section id="install">
+  <div class="wrap">
+    <h2 class="h2">Two ways to install</h2>
+    <p class="p">Pick the path that fits how you like to use your device. You can switch later.</p>
+
+    <div class="paths">
+      <article class="path s" data-path="standalone" tabindex="0">
+        <span class="tag">Recommended</span>
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/><path d="M9 2v2M15 2v2M9 20v2M15 20v2M2 9h2M2 15h2M20 9h2M20 15h2"/></svg></div>
+        <h3>Standalone</h3>
+        <p>Just wadamesh — the device boots straight into the touch UI.</p>
+        <div class="good">Best if you want the <b>simplest path</b>: flash once, from your browser, and you're done.</div>
+        <span class="pick">Choose standalone <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
+      </article>
+
+      <article class="path l" data-path="launcher" tabindex="0">
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></div>
+        <h3>With Launcher</h3>
+        <p>Run wadamesh as one app inside <b>bmorcelli's Launcher</b>.</p>
+        <div class="good">Best if you want to <b>keep multiple firmwares</b> and switch between them from a menu.</div>
+        <span class="pick">Choose Launcher <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M13 6l6 6-6 6"/></svg></span>
+      </article>
+    </div>
+
+    <!-- STANDALONE -->
+    <div class="guide s" id="g-standalone">
+      <button class="back" data-back>← choose a different path</button>
+      <div class="guide-head"><h3>Standalone install</h3></div>
+      <p class="p" style="margin-bottom:22px">Plug the device in over USB and flash it right here. Works in <b>Chrome</b> or <b>Edge</b> on desktop.</p>
+      <div class="steps" style="margin-bottom:22px">
+        <div class="step"><div class="num">1</div><div><h4>Connect over USB</h4><p>Plug your T-Deck or Heltec V4 into your computer with a data cable.</p></div></div>
+        <div class="step"><div class="num">2</div><div><h4>Pick your board &amp; install</h4><p>Hit <b>Install</b> below, choose the serial port, and let it flash. It does a clean full install.</p></div></div>
+        <div class="step"><div class="num">3</div><div><h4>You're on the mesh</h4><p>The device reboots into wadamesh. Set your name + region in the first-run wizard.</p></div></div>
+      </div>
+      <div class="boards">
+        <div class="board"><h4>Heltec V4 + TFT</h4><p>ESP32-S3 with CHSC6x touch.</p>
+          <esp-web-install-button manifest="./manifest-heltec-v4-tft.json"></esp-web-install-button></div>
+        <div class="board"><h4>LilyGo T-Deck / Plus</h4><p>ESP32-S3 keyboard handheld.</p>
+          <esp-web-install-button manifest="./manifest-tdeck.json"></esp-web-install-button></div>
+      </div>
+      <div class="noserial">Your browser can't flash here — use <b>Chrome</b> or <b>Edge</b> on a desktop, or grab the <a href="https://flasher.wadamesh.com">flasher</a>.</div>
+      <p class="hint">T-Deck not detected? Hold the trackball while tapping reset to force download mode.</p>
+    </div>
+
+    <!-- LAUNCHER -->
+    <div class="guide l" id="g-launcher">
+      <button class="back" data-back>← choose a different path</button>
+      <div class="guide-head"><h3>Install with bmorcelli's Launcher</h3></div>
+      <p class="p" style="margin-bottom:22px"><a href="https://github.com/bmorcelli/Launcher" target="_blank" rel="noopener">Launcher</a> is a multi-app boot menu for ESP32 devices — keep it, and run wadamesh as one of your apps.</p>
+      <div class="steps" style="margin-bottom:22px">
+        <div class="step"><div class="num">1</div><div><h4>Install Launcher first</h4><p>Flash bmorcelli's Launcher to your device, following its own installer — <a href="https://github.com/bmorcelli/Launcher" target="_blank" rel="noopener">github.com/bmorcelli/Launcher</a>.</p></div></div>
+        <div class="step"><div class="num">2</div><div><h4>Add the wadamesh app</h4><p>Grab the wadamesh <b>app image</b> for your board below, then install it from Launcher (via its web UI / OTA, or copy the <code>.bin</code> to your SD card).</p></div></div>
+        <div class="step"><div class="num">3</div><div><h4>Launch wadamesh</h4><p>Pick wadamesh from the Launcher menu. Settings persist to SD, so they survive Launcher's slim partition.</p></div></div>
+      </div>
+      <div class="boards">
+        <div class="board"><h4>Heltec V4 + TFT</h4><p>app image (no bootloader)</p>
+          <a class="dl" href="https://firmware.wadamesh.com/latest/wadamesh-heltec-v4-tft.bin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 11l5 5 5-5M5 21h14"/></svg>Download .bin</a></div>
+        <div class="board"><h4>LilyGo T-Deck / Plus</h4><p>app image (no bootloader)</p>
+          <a class="dl" href="https://firmware.wadamesh.com/latest/wadamesh-tdeck.bin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12M7 11l5 5 5-5M5 21h14"/></svg>Download .bin</a></div>
+      </div>
+      <p class="hint">New to Launcher? It's the easiest way to try wadamesh without giving up your other firmware — and you can fully switch to Standalone any time.</p>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    Built for the mesh · open source under GPL-3.0 ·
+    <a href="https://github.com/ALLFATHER-BV/wadamesh">github.com/ALLFATHER-BV/wadamesh</a><br>
+    Map tiles © OpenStreetMap contributors. Not affiliated with bmorcelli's Launcher.
+  </div>
+</footer>
+
+<script>
+  if (!('serial' in navigator)) document.body.classList.add('no-serial');
+
+  const paths = document.querySelectorAll('.path');
+  const guides = { standalone: document.getElementById('g-standalone'), launcher: document.getElementById('g-launcher') };
+  function choose(name){
+    paths.forEach(p => p.classList.toggle('sel', p.dataset.path === name));
+    for (const k in guides) guides[k].classList.toggle('show', k === name);
+    guides[name].scrollIntoView({ behavior:'smooth', block:'start' });
+    history.replaceState(null,'','#'+name);
+  }
+  paths.forEach(p => {
+    p.addEventListener('click', () => choose(p.dataset.path));
+    p.addEventListener('keydown', e => { if(e.key==='Enter'||e.key===' '){ e.preventDefault(); choose(p.dataset.path);} });
+  });
+  document.querySelectorAll('[data-back]').forEach(b => b.addEventListener('click', () => {
+    paths.forEach(p=>p.classList.remove('sel'));
+    for(const k in guides) guides[k].classList.remove('show');
+    document.getElementById('install').scrollIntoView({behavior:'smooth'});
+    history.replaceState(null,'','#install');
+  }));
+  if (location.hash === '#standalone' || location.hash === '#launcher') choose(location.hash.slice(1));
+
+  // lightweight animated mesh backdrop
+  const cv = document.querySelector('.mesh'), cx = cv.getContext('2d');
+  let W,H,pts;
+  function init(){ W=cv.width=innerWidth; H=cv.height=Math.max(innerHeight,520);
+    const n = Math.min(64, Math.floor(W*H/26000));
+    pts = Array.from({length:n}, ()=>({x:Math.random()*W,y:Math.random()*H,vx:(Math.random()-.5)*.25,vy:(Math.random()-.5)*.25})); }
+  function tick(){ cx.clearRect(0,0,W,H);
+    for(const p of pts){ p.x+=p.vx; p.y+=p.vy; if(p.x<0||p.x>W)p.vx*=-1; if(p.y<0||p.y>H)p.vy*=-1; }
+    for(let i=0;i<pts.length;i++){ for(let j=i+1;j<pts.length;j++){
+      const a=pts[i],b=pts[j],d=Math.hypot(a.x-b.x,a.y-b.y);
+      if(d<130){ cx.strokeStyle='rgba(74,163,255,'+(.16*(1-d/130))+')'; cx.lineWidth=1;
+        cx.beginPath(); cx.moveTo(a.x,a.y); cx.lineTo(b.x,b.y); cx.stroke(); } } }
+    for(const p of pts){ cx.fillStyle='rgba(120,170,220,.35)'; cx.beginPath(); cx.arc(p.x,p.y,1.5,0,7); cx.fill(); }
+    requestAnimationFrame(tick); }
+  addEventListener('resize', init); init(); tick();
+</script>
+</body>
+</html>

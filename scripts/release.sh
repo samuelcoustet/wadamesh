@@ -34,7 +34,8 @@ for pair in $ENVS; do
   "$PIO" run -t mergebin -e "$env"
   cp ".pio/build/$env/firmware.bin"        "$REL/$TAG/$name.bin"
   cp ".pio/build/$env/firmware-merged.bin" "$REL/$TAG/$name-merged.bin"
-  cp ".pio/build/$env/firmware-merged.bin" "$LATEST/$name-merged.bin"   # rolling latest -> web flasher
+  cp ".pio/build/$env/firmware-merged.bin" "$LATEST/$name-merged.bin"   # rolling latest -> web flasher (standalone)
+  cp ".pio/build/$env/firmware.bin"        "$LATEST/$name.bin"          # rolling latest app image -> Launcher path
 done
 
 # 3. Regenerate the update-check listing (the firmware scans the body for the
