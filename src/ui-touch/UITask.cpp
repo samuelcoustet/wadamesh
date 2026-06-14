@@ -14994,7 +14994,11 @@ static void openMessageInfoPopup(int msg_idx) {
   const int  route_pts  = buildRouteFromMessage(m);
   const bool show_route = (route_pts >= 2);
   const int card_w = 220;
-  const int card_h = (show_trace || show_route) ? 290 : 250;
+  int card_h = (show_trace || show_route) ? 290 : 250;
+  // Never taller than the screen; the body inside scrolls if it doesn't fit
+  // (matters on the short 320x240 T-Deck in landscape).
+  const int avail_h = sh - STATUSBAR_H - 8;
+  if (card_h > avail_h) card_h = avail_h;
   lv_obj_t* card = lv_obj_create(s_msg_info_root);
   lv_obj_remove_style_all(card);
   lv_obj_set_size(card, card_w, card_h);
@@ -15122,7 +15126,7 @@ static void openMessageInfoPopup(int msg_idx) {
   if (blen >= (int)sizeof(body)) blen = sizeof(body) - 1;
   body[blen] = '\0';
 
-  // Title row at top-left, sized to clear the close-X (top-right 32 px).
+  // Title row at top-left, sized to clear the close-X (top-right 32 px). Pinned.
   lv_obj_t* title = lv_label_create(card);
   lv_label_set_text(title, TR("Message info"));
   lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
@@ -15131,16 +15135,33 @@ static void openMessageInfoPopup(int msg_idx) {
   lv_obj_set_width(title, card_w - 20 - 32);
   lv_obj_set_pos(title, 0, 4);
 
-  // Body sits BELOW the close-X zone so it can use the full card width
-  // without any overlap risk.
-  lv_obj_t* lbl = lv_label_create(card);
+  // Scrollable body between the pinned title and the pinned button row, so a
+  // long route (or a small screen) never overflows the card or pushes the
+  // buttons off — the metadata just scrolls.
+  const int content_h = card_h - 20;                  // card has pad_all = 10
+  const int body_top  = 30;
+  const int body_bot  = (show_route || show_trace) ? (content_h - 40) : content_h;  // 40 = button row + gap
+  lv_obj_t* bodywrap = lv_obj_create(card);
+  lv_obj_remove_style_all(bodywrap);
+  lv_obj_set_size(bodywrap, card_w - 20, body_bot - body_top);
+  lv_obj_set_pos(bodywrap, 0, body_top);
+  lv_obj_set_style_bg_opa(bodywrap, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(bodywrap, LV_DIR_VER);
+  lv_obj_set_scrollbar_mode(bodywrap, LV_SCROLLBAR_MODE_AUTO);
+  // Thin visible scrollbar (remove_style_all wiped the theme's).
+  lv_obj_set_style_width(bodywrap, 4, LV_PART_SCROLLBAR);
+  lv_obj_set_style_bg_color(bodywrap, lv_color_hex(0x6FA8DA), LV_PART_SCROLLBAR);
+  lv_obj_set_style_bg_opa(bodywrap, LV_OPA_70, LV_PART_SCROLLBAR);
+  lv_obj_set_style_radius(bodywrap, 2, LV_PART_SCROLLBAR);
+
+  lv_obj_t* lbl = lv_label_create(bodywrap);
   lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-  lv_obj_set_width(lbl, card_w - 20);
+  lv_obj_set_width(lbl, card_w - 20 - 8);             // leave room for the scrollbar
   lv_label_set_text(lbl, body);
   lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_set_style_text_font(lbl, &g_font_12, LV_PART_MAIN);
-  lv_obj_set_pos(lbl, 0, 32);
-  // Long-press the body to copy the full dump — useful for paste-into-bug-report.
+  lv_obj_set_pos(lbl, 0, 0);
+  // Long-press the body to copy the full dump (a drag scrolls, a hold copies).
   lv_obj_add_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(lbl, copyLabelLongPressCb, LV_EVENT_LONG_PRESSED,
                       const_cast<char*>("info"));
