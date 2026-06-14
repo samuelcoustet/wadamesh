@@ -4913,10 +4913,18 @@ static void sysInfoText(char* buf, size_t cap) {
 static void refreshSysInfo(unsigned long now) {
   static unsigned long next = 0;
   if ((long)(now - next) < 0) return;
+  if (!s_sysinfo_lbl || getActiveTab() != SETTINGS_TAB_INDEX || s_settings_open_cat != CAT_ABOUT) {
+    next = now + 1000;   // not on the About sheet — just rate-limit
+    return;
+  }
+  // Re-setting an ~800-char label re-wraps + repaints it; doing that every second
+  // WHILE the user drags or flings the page stutters the scroll badly. Hold off
+  // while a pointer is pressed or a scroll/throw is in flight, and re-check soon
+  // so the live uptime/heap resumes the instant they let go.
+  for (lv_indev_t* in = lv_indev_get_next(nullptr); in; in = lv_indev_get_next(in)) {
+    if (lv_indev_get_scroll_dir(in) != LV_DIR_NONE) { next = now + 120; return; }
+  }
   next = now + 1000;
-  if (!s_sysinfo_lbl) return;
-  if (getActiveTab() != SETTINGS_TAB_INDEX) return;
-  if (s_settings_open_cat != CAT_ABOUT) return;   // sysinfo lives on the About detail sheet
   char buf[800];
   sysInfoText(buf, sizeof buf);
   lv_label_set_text(s_sysinfo_lbl, buf);
