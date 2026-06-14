@@ -11088,6 +11088,95 @@ static void homeFilesCb(lv_event_t* e) {
 }
 #endif
 
+// ===== Signal & traffic detail popup (tap the home RX/TX graph) =============
+static lv_obj_t* s_siginfo_root = nullptr;
+static void closeSigInfoPopup() {
+  if (s_siginfo_root) { lv_obj_del_async(s_siginfo_root); s_siginfo_root = nullptr; }
+}
+static void sigInfoDismissCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  // Close on the backdrop or the X (target == the object the cb is on); a tap on
+  // the card (which bubbles up) leaves it open.
+  if (lv_event_get_target(e) != lv_event_get_current_target(e)) return;
+  lv_indev_t* a = lv_indev_get_act(); if (a) lv_indev_wait_release(a);
+  closeSigInfoPopup();
+}
+static void openSignalInfoPopup() {
+  closeSigInfoPopup();
+  lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+  lv_coord_t sh = lv_disp_get_ver_res(nullptr);
+  s_siginfo_root = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(s_siginfo_root);
+  lv_obj_set_size(s_siginfo_root, sw, sh - STATUSBAR_H);
+  lv_obj_set_pos(s_siginfo_root, 0, STATUSBAR_H);
+  lv_obj_set_style_bg_color(s_siginfo_root, lv_color_hex(0x000000), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_siginfo_root, LV_OPA_60, LV_PART_MAIN);
+  lv_obj_clear_flag(s_siginfo_root, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_event_cb(s_siginfo_root, sigInfoDismissCb, LV_EVENT_CLICKED, nullptr);
+
+  const int card_w = 226;
+  int card_h = 248;
+  const int avail = sh - STATUSBAR_H - 8;
+  if (card_h > avail) card_h = avail;
+  lv_obj_t* card = lv_obj_create(s_siginfo_root);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_size(card, card_w, card_h);
+  lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_radius(card, 8, LV_PART_MAIN);
+  lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(card, 10, LV_PART_MAIN);
+  lv_obj_set_scroll_dir(card, LV_DIR_VER);
+  addCloseXBadge(card, sigInfoDismissCb);
+
+  lv_obj_t* ttl = lv_label_create(card);
+  lv_label_set_text(ttl, TR("Signal & traffic"));
+  lv_obj_set_style_text_color(ttl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_style_text_font(ttl, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_pos(ttl, 0, 2);
+
+  char body[420]; int n = 0;
+  const uint32_t sms   = the_mesh.uiSignalMs();
+  const bool     heard = (sms != 0);
+  const uint32_t age   = heard ? (millis() - sms) : 0;
+  const bool     stale = !heard || age > 300000UL;
+  if (!heard) {
+    n += snprintf(body + n, sizeof(body) - n, "Signal\n  nothing heard yet");
+  } else {
+    const float snr  = the_mesh.uiSignalSnrQ4() / 4.0f;
+    const int   rssi = the_mesh.uiSignalRssi();
+    const int   level = stale ? 0 : (snr >= 5 ? 4 : snr >= 0 ? 3 : snr >= -7 ? 2 : 1);
+    char ago[24];
+    if (age < 60000UL)        snprintf(ago, sizeof ago, "%lus ago", (unsigned long)(age / 1000));
+    else if (age < 3600000UL) snprintf(ago, sizeof ago, "%lum ago", (unsigned long)(age / 60000));
+    else                      snprintf(ago, sizeof ago, "%luh ago", (unsigned long)(age / 3600000UL));
+    n += snprintf(body + n, sizeof(body) - n,
+      "Signal%s\n  SNR    %.1f dB\n  RSSI   %d dBm\n  Bars   %d / 4\n  Heard  %s",
+      stale ? " (stale)" : "", (double)snr, rssi, level, ago);
+  }
+  n += snprintf(body + n, sizeof(body) - n,
+    "\n\nTraffic (since boot)\n  Sent   %u flood, %u direct\n  Recv   %u flood, %u direct",
+    (unsigned)the_mesh.getNumSentFlood(), (unsigned)the_mesh.getNumSentDirect(),
+    (unsigned)the_mesh.getNumRecvFlood(), (unsigned)the_mesh.getNumRecvDirect());
+  n += snprintf(body + n, sizeof(body) - n,
+    "\n\nAuto-discover: every 60 s (zero-hop advert)");
+  (void)n;
+
+  lv_obj_t* lbl = lv_label_create(card);
+  lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+  lv_obj_set_width(lbl, card_w - 20);
+  lv_label_set_text(lbl, body);
+  lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_style_text_font(lbl, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_pos(lbl, 0, 30);
+}
+static void homeChartClickedCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  openSignalInfoPopup();
+}
+
 static void makeHome(lv_obj_t* tab) {
   // Layout (240 wide × 282 tall): title + heartbeat + battery at top, status
   // lines, TX/RX chart in the middle, Send Advert button at the bottom.
@@ -11153,6 +11242,9 @@ static void makeHome(lv_obj_t* tab) {
   lv_obj_set_style_text_color(s_home_chart_legend, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(s_home_chart_legend, &g_font_12, LV_PART_MAIN);
   lv_obj_align(s_home_chart_legend, LV_ALIGN_TOP_LEFT, 0, chart_y);
+  lv_obj_add_flag(s_home_chart_legend, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_ext_click_area(s_home_chart_legend, 8);
+  lv_obj_add_event_cb(s_home_chart_legend, homeChartClickedCb, LV_EVENT_CLICKED, nullptr);
 
 #if defined(HAS_TDECK_GT911)
   // Landscape T-Deck: the right column holds Advert + Terminal + Files, so the
@@ -11195,6 +11287,9 @@ static void makeHome(lv_obj_t* tab) {
                                           LV_CHART_AXIS_PRIMARY_Y);
     s_home_chart_rx = lv_chart_add_series(s_home_chart, lv_color_hex(0x4F94CD),
                                           LV_CHART_AXIS_PRIMARY_Y);
+    // Tap the graph for the signal & traffic detail popup.
+    lv_obj_add_flag(s_home_chart, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_home_chart, homeChartClickedCb, LV_EVENT_CLICKED, nullptr);
   }
 
   // Send Advert button. Portrait: full-width row below the chart. Landscape:
@@ -18476,9 +18571,12 @@ static void refreshStatusLabels() {
     }
     // Legend: total counts since boot, plus the current y-range peak.
     if (s_home_chart_legend) {
-      lv_label_set_text_fmt(s_home_chart_legend,
-                            TR("TX %u  /  RX %u   (max %d/tick)"),
-                            (unsigned)cur_tx, (unsigned)cur_rx, s_chart_max_y);
+      const uint32_t sms = the_mesh.uiSignalMs();
+      char sigtxt[16];
+      if (sms == 0 || (millis() - sms) > 300000UL) snprintf(sigtxt, sizeof sigtxt, "Sig --");
+      else snprintf(sigtxt, sizeof sigtxt, "Sig %ddB", the_mesh.uiSignalSnrQ4() / 4);
+      lv_label_set_text_fmt(s_home_chart_legend, "%s   TX %u  RX %u  (tap)",
+                            sigtxt, (unsigned)cur_tx, (unsigned)cur_rx);
     }
   }
   const bool settings_active = (active_tab == SETTINGS_TAB_INDEX);

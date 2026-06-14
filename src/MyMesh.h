@@ -398,8 +398,10 @@ public:
   // Updated on EVERY received packet in logRxRaw(): the SNR (×4) + millis() at RX.
   // The UI maps it to bars and dims them when nothing's been heard for a while.
   int8_t   _ui_sig_snr_q4 = -128;   // SNR_dB * 4 of the last RX (-128 = nothing yet)
+  int8_t   _ui_sig_rssi   = 0;      // RSSI dBm of the last RX
   uint32_t _ui_sig_ms     = 0;      // millis() at that RX (0 = nothing heard yet)
   int8_t   uiSignalSnrQ4() const { return _ui_sig_snr_q4; }
+  int8_t   uiSignalRssi()  const { return _ui_sig_rssi; }
   uint32_t uiSignalMs()    const { return _ui_sig_ms; }
 
   /** Fingerprint of the most-recently originated flood TXT payload (0 if none). */
