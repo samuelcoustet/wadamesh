@@ -267,6 +267,10 @@ extern "C" const lv_font_t person_font14;   // 14 px — for g_font_14 (chat lis
 #define TOUCH_SYM_PERSON  "\xEF\x80\x87"   /* U+F007 user */
 #define TOUCH_SYM_ANTENNA "\xEF\x94\x99"   /* U+F519 tower-broadcast */
 #define TOUCH_SYM_GROUP   "\xEF\x83\x80"   /* U+F0C0 users (group) */
+// FontAwesome "magnifying-glass" (U+F002), 16 px — for the map zoom button. Its
+// own one-glyph font, spliced into the g_font_16 fallback chain like person_font.
+extern "C" const lv_font_t zoom_font;
+#define TOUCH_SYM_ZOOM    "\xEF\x80\x82"   /* U+F002 magnifying-glass */
 
 // Extras fallback fonts — em-dash (U+2014), ellipsis (U+2026), middle dot
 // (U+00B7). LVGL's stock Montserrat subset doesn't include these, so any
@@ -331,6 +335,12 @@ static void initTouchFontFallbacks() {
   s_person_font = person_font;
   s_person_font.fallback = g_font_16.fallback;
   g_font_16.fallback = &s_person_font;
+  // Map zoom magnifier (U+F002) — head of the g_font_16 chain (overlay buttons
+  // render in g_font_16). One PUA codepoint; misses on it are free for plain text.
+  static lv_font_t s_zoom_font;
+  s_zoom_font = zoom_font;
+  s_zoom_font.fallback = g_font_16.fallback;
+  g_font_16.fallback = &s_zoom_font;
   // Also reach the person/antenna/group glyphs from g_font_14 — the contact
   // action sheet title and the Chats-list rows render the icon inline with 14 px
   // text. Use the 14 px-rendered person_font14 (NOT the 16 px person_font) so the
@@ -16868,7 +16878,7 @@ static void makeMapTab(lv_obj_t* tab) {
   // Options gear sits at the TOP of the right-edge column; zoom/recenter below,
   // then a "contacts on map" picker (list of GPS-bearing contacts → recenter).
   make_overlay_btn(LV_SYMBOL_SETTINGS, 4,         mapOpenOptionsCb);
-  make_overlay_btn(LV_SYMBOL_PLUS,     4 + 32,    mapZoomToggleCb);   // toggles the zoom slider (was +/-)
+  make_overlay_btn(TOUCH_SYM_ZOOM,     4 + 32,    mapZoomToggleCb);   // magnifier — toggles the zoom slider (was +/-)
   make_overlay_btn(LV_SYMBOL_GPS,      4 + 32*2,  mapRecenterCb);
   make_overlay_btn(LV_SYMBOL_LIST,     4 + 32*3,  mapOpenContactsCb);
 
