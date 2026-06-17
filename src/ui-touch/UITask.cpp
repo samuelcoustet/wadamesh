@@ -10096,7 +10096,7 @@ static void openBatteryChartWindow() {
   const lv_coord_t cardw = sw - 24;
   lv_obj_t* card = lv_obj_create(s_batt_chart_root);
   lv_obj_remove_style_all(card);
-  lv_obj_set_size(card, cardw, 236);
+  lv_obj_set_size(card, cardw, 246);
   lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 8);
   styleSurface(card, COLOR_PANEL, 8);
   lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
@@ -10187,7 +10187,7 @@ static void openBatteryChartWindow() {
   lv_chart_set_axis_tick(chart, LV_CHART_AXIS_SECONDARY_Y, 4, 0, 4, 1, true, 40);
   lv_obj_add_event_cb(chart, battChartTickCb, LV_EVENT_DRAW_PART_BEGIN, nullptr);
   lv_chart_series_t* vser = lv_chart_add_series(chart, lv_color_hex(0x4F9DF7), LV_CHART_AXIS_PRIMARY_Y);   // blue battery
-  lv_chart_series_t* cser = lv_chart_add_series(chart, lv_color_hex(0xF5A623), LV_CHART_AXIS_SECONDARY_Y); // orange CPU
+  lv_chart_series_t* cser = lv_chart_add_series(chart, lv_color_hex(0x7A5311), LV_CHART_AXIS_SECONDARY_Y); // dim orange CPU (half-bright, less prominent)
   for (int i = 0; i < n; ++i) {
     lv_coord_t v = (lv_coord_t)mvs[i];
     if (v > y_top) v = y_top;             // charging spike -> ride the top line
@@ -10207,16 +10207,27 @@ static void openBatteryChartWindow() {
   x_lbl("-24h", LV_ALIGN_OUT_BOTTOM_LEFT);
   x_lbl("now",  LV_ALIGN_OUT_BOTTOM_RIGHT);
 
-  char sub[88];
-  snprintf(sub, sizeof sub, "now %u.%02u V (full %u.%01u)   CPU %u MHz   %d pts",
+  // Bottom text, stacked so the points count gets its own line and the longer
+  // lines are width-capped to clear the bottom-right trash button.
+  const lv_coord_t btxt_w = cardw - 20 - 36;   // leave room for the trash button
+  char sub[72];
+  snprintf(sub, sizeof sub, "now %u.%02u V (full %u.%01u)   CPU %u MHz",
            (unsigned)(mvs[n-1] / 1000), (unsigned)((mvs[n-1] % 1000) / 10),
            (unsigned)(y_top / 1000), (unsigned)((y_top % 1000) / 100),
-           (unsigned)getCpuFrequencyMhz(), n);
+           (unsigned)getCpuFrequencyMhz());
   lv_obj_t* sl = lv_label_create(card);
   lv_label_set_text(sl, sub);
   lv_obj_set_style_text_font(sl, &g_font_12, LV_PART_MAIN);
   lv_obj_set_style_text_color(sl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
-  lv_obj_align(sl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+  lv_obj_set_width(sl, btxt_w);
+  lv_label_set_long_mode(sl, LV_LABEL_LONG_DOT);
+  lv_obj_align(sl, LV_ALIGN_BOTTOM_LEFT, 0, -16);
+
+  lv_obj_t* pl = lv_label_create(card);   // points count on its own bottom line
+  lv_label_set_text_fmt(pl, "%d pts", n);
+  lv_obj_set_style_text_font(pl, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(pl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_align(pl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
   // Estimated remaining battery life (discharge-rate fit over the logged window).
   char est[44];
@@ -10225,7 +10236,8 @@ static void openBatteryChartWindow() {
   lv_label_set_text(el, est);
   lv_obj_set_style_text_font(el, &g_font_14, LV_PART_MAIN);
   lv_obj_set_style_text_color(el, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
-  lv_obj_align(el, LV_ALIGN_BOTTOM_LEFT, 0, -18);
+  lv_obj_set_width(el, btxt_w);
+  lv_obj_align(el, LV_ALIGN_BOTTOM_LEFT, 0, -32);
 
   // Clear the battery history (with confirmation).
   lv_obj_t* clr = lv_btn_create(card);
