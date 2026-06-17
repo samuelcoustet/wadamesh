@@ -21203,6 +21203,8 @@ static void openAppDrawer() {
   lv_obj_set_style_bg_color(s_appdrawer_root, lv_color_hex(COLOR_BG), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(s_appdrawer_root, LV_OPA_COVER, LV_PART_MAIN);
   lv_obj_set_scroll_dir(s_appdrawer_root, LV_DIR_VER);   // grid scrolls top->bottom when it overflows
+  lv_obj_set_scrollbar_mode(s_appdrawer_root, LV_SCROLLBAR_MODE_AUTO);
+  lv_obj_set_style_pad_bottom(s_appdrawer_root, 10, LV_PART_MAIN);   // room past the last row when scrolled
   lv_obj_move_foreground(s_appdrawer_root);
 
   // First tile is "Command" (back to the command centre); the rest are the apps.
@@ -21229,10 +21231,10 @@ static void openAppDrawer() {
   };
   const int n = (int)(sizeof(tiles) / sizeof(tiles[0]));
 
-  // Column count: 4 on the T-Deck (11 tiles incl. Terminal/Files), 3 on the V4
-  // (9 tiles -> a clean 3x3 grid instead of a sparse 4+4+1). Tile height shrinks
-  // so ALL rows fit the screen with no scrolling, capped so tiles don't balloon.
-  // Scroll stays enabled only as a safety net if a row still overflows.
+  // Column count: 4 on the T-Deck, 3 on the V4 (a cleaner grid for the smaller
+  // tile set). Tile height is sized to fit the rows on screen but CLAMPED to a
+  // comfortable [60, 84] px band — so a full app list overflows into the vertical
+  // scroll region rather than shrinking the tiles to tiny squares.
 #if defined(HAS_TDECK_GT911)
   const int cols = 4;
 #else
@@ -21245,6 +21247,7 @@ static void openAppDrawer() {
   const int avail  = (sh - STATUSBAR_H - TABBAR_H) - top - 8;   // content area minus top inset + bottom margin
   int tile_h = (avail - (rows - 1) * gap) / rows;
   if (tile_h > 84) tile_h = 84;
+  if (tile_h < 60) tile_h = 60;   // floor: overflow scrolls instead of shrinking to tiny tiles
   for (int i = 0; i < n; i++) {
     const int col = i % cols, row = i / cols;
     addAppTile(s_appdrawer_root, pad + col * (tile_w + gap), top + row * (tile_h + gap),
