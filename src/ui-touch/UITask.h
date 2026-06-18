@@ -29,7 +29,7 @@ enum class TouchUiScreen : uint8_t { Home = 0, ChatInbox = 1, Contacts = 2, Sett
 
 class UITask : public AbstractUITask {
 public:
-  static const int MAX_UI_MESSAGES = 96;
+  static const int MAX_UI_MESSAGES = 500;
   static const int MAX_UI_THREADS = 48;
   static const int MAX_THREAD_NAME = 32;
   static const int MAX_SENDER_NAME = 24;
@@ -160,8 +160,10 @@ private:
   TouchUiScreen _touch_screen;
   bool _active_dm_contact_set;
   uint8_t _active_dm_contact_pub[32];
-  bool _history_dirty;
-  unsigned long _next_history_flush_ms;
+  bool _threads_dirty;
+  unsigned long _next_threads_flush_ms;
+  bool _msgs_dirty;
+  unsigned long _next_msgs_flush_ms;
 
   void userLedHandler();
 
@@ -213,10 +215,15 @@ private:
   void appendComposerText(const char* text);
   void backspaceComposerChar();
   bool sendComposerToActiveThread();
-  void markHistoryDirty(unsigned long delay_ms = 600);
+  void markThreadsDirty(unsigned long delay_ms = 200);
+  void markMsgsDirty(unsigned long delay_ms = 2000);
   void flushHistoryIfDue(unsigned long now);
   bool loadHistoryFromStorage();
-  bool saveHistoryToStorage();
+  bool loadThreadsFromStorage();
+  bool loadMsgsFromStorage();
+  bool loadLegacyHistoryFromStorage();
+  bool saveThreadsToStorage();
+  bool saveMsgsToStorage();
 
   void setCurrScreen(UIScreen* c);
 
@@ -230,8 +237,10 @@ public:
     _next_mesh_thread_refresh = 0;
     _active_dm_contact_set = false;
     memset(_active_dm_contact_pub, 0, sizeof(_active_dm_contact_pub));
-    _history_dirty = false;
-    _next_history_flush_ms = 0;
+    _threads_dirty = false;
+    _next_threads_flush_ms = 0;
+    _msgs_dirty = false;
+    _next_msgs_flush_ms = 0;
     _last_input_ms = 0;
     _screen_timeout_ms = 20000;  // overridden by NVS in begin()
     _screen_off = false;

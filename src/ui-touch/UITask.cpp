@@ -109,6 +109,15 @@ constexpr uint16_t k_ui_history_version = 6;   // v6: MAX_MSG_TEXT 96 -> 160 (re
 // predates that layout and is discarded.
 constexpr uint16_t k_ui_history_min_version = 6;   // v4/v5 used 96-char records; reject (don't mis-read)
 
+// Split-format file paths. Thread metadata and the message ring are written
+// to separate files so unread counts (small, ~4 KB) can flush at 200 ms while
+// the ring (larger, scales with MAX_UI_MESSAGES) flushes lazily every 2 s,
+// reducing flash write pressure when the ring is large.
+constexpr const char* k_ui_threads_path = "/ui_threads_v1.bin";
+constexpr const char* k_ui_msgs_path    = "/ui_msgs_v1.bin";
+constexpr uint32_t k_ui_threads_magic   = 0x55495448;  // "UITH"
+constexpr uint32_t k_ui_msgs_magic      = 0x55494D53;  // "UIMS"
+
 struct __attribute__((packed)) UiHistoryHeader {
   uint32_t magic;
   uint16_t version;
@@ -159,6 +168,20 @@ struct __attribute__((packed)) UiHistoryMsg {
   // The v5+ loader zero-fills appended fields for older blobs, so appending
   // never wipes chat history. Inserting in the middle (as v4 did) breaks that
   // and must instead raise k_ui_history_min_version.
+};
+
+// Header for the split message-ring file (/ui_msgs_v1.bin). The thread file
+// (/ui_threads_v1.bin) reuses UiHistoryHeader (it holds active_thread_idx and
+// thread_rec_size). This smaller header holds only the ring-specific fields.
+struct __attribute__((packed)) UiMsgFileHeader {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t reserved;
+  uint16_t ui_msg_count;
+  uint16_t ui_msg_head;
+  uint32_t msgcount;
+  uint16_t msg_rec_size;
+  uint8_t  _pad[2];
 };
 } // namespace
 #endif
@@ -2631,6 +2654,12 @@ static void closeChatPanel(LvChatPanel* p) {
   hideKb();
   if (p->overlay) lv_obj_add_flag(p->overlay, LV_OBJ_FLAG_HIDDEN);
   p->detail_open = false;
+  // Mark the active thread read on close so messages that arrived while the
+  // chat was open don't leave a stale unread badge in the inbox. Also force
+  // a list rebuild so the badge clears immediately instead of waiting for the
+  // next 4-second periodic refresh.
+  if (g_lv.task) g_lv.task->markThreadRead(g_lv.task->activeThreadIdx());
+  g_lv.dirty_threads = true;
   s_unread_at_open = 0;          // clear the unread divider when leaving the chat
   s_chat_just_opened = false;
   if (p->jump_btn) lv_obj_add_flag(p->jump_btn, LV_OBJ_FLAG_HIDDEN);
@@ -4672,7 +4701,7 @@ static void doExportBackupFile(const char* fname);   // write a backup (SD if a 
 // task_wdt_isr while another thread was in spiffs_gc_clean). Bracket such writes
 // so a bounded-but-slow GC pass can't reset the device. The same pattern the
 // file-manager format/paste paths already use. Ref-counted so a nested guard
-// (import -> persistHistoryNow -> saveHistoryToStorage) doesn't re-enable early.
+// (import -> persistHistoryNow -> saveThreadsToStorage/saveMsgsToStorage) doesn't re-enable early.
 static int s_wdt_heavy_depth = 0;
 // IMPORTANT: touch ONLY core 0's IDLE-task WDT here. In the Arduino S3 build
 // only core 0's idle task is subscribed to the task watchdog
@@ -23318,28 +23347,39 @@ void UITask::onAdminCommandReply(const ContactInfo& contact, const char* text) {
   adminLogAppend("", text ? text : "");
 }
 
-void UITask::markHistoryDirty(unsigned long delay_ms) {
-  _history_dirty = true;
-  _next_history_flush_ms = millis() + delay_ms;
+void UITask::markThreadsDirty(unsigned long delay_ms) {
+  const unsigned long deadline = millis() + delay_ms;
+  if (!_threads_dirty || deadline < _next_threads_flush_ms)
+    _next_threads_flush_ms = deadline;
+  _threads_dirty = true;
+}
+
+void UITask::markMsgsDirty(unsigned long delay_ms) {
+  const unsigned long deadline = millis() + delay_ms;
+  if (!_msgs_dirty || deadline < _next_msgs_flush_ms)
+    _next_msgs_flush_ms = deadline;
+  _msgs_dirty = true;
+  markThreadsDirty(200);  // thread state (last_ts, unread) also changed
 }
 
 void UITask::flushHistoryIfDue(unsigned long now) {
-  // Synchronous, prompt save — same as the released build, which persisted
-  // reliably (a hardware reset shortly after a message keeps the chat). The
-  // save runs ~delay after each change (markHistoryDirty) and writes from
-  // internal RAM, so it's quick. (The async-to-worker experiment widened the
-  // reset-loss window and starved the LOS worker — reverted.)
-  if (!_history_dirty) return;
-  if (now < _next_history_flush_ms) return;
-  if (saveHistoryToStorage()) _history_dirty = false;
-  else _next_history_flush_ms = now + 2000;
+  // Thread metadata (~4 KB) flushes on a short delay; the message ring
+  // (scales with MAX_UI_MESSAGES) flushes lazily to reduce flash write pressure.
+  if (_threads_dirty && now >= _next_threads_flush_ms) {
+    if (saveThreadsToStorage()) _threads_dirty = false;
+    else _next_threads_flush_ms = now + 2000;
+  }
+  if (_msgs_dirty && now >= _next_msgs_flush_ms) {
+    if (saveMsgsToStorage()) _msgs_dirty = false;
+    else _next_msgs_flush_ms = now + 2000;
+  }
 }
 
 // ---- UI-side data storage (chat history) -------------------------------------
 // Resolve ONCE where the touch UI's own files live: internal SPIFFS when present,
 // else the SD card under /meshcomod (Launcher / SD-storage installs have no SPIFFS
 // partition). Caching the result is what stops the "SPIFFS partition could not be
-// found" spam — saveHistoryToStorage runs every ~2 s, and re-calling SPIFFS.begin()
+// found" spam — the history flush runs every ~2 s, and re-calling SPIFFS.begin()
 // each time both logged the error and, under Launcher, never actually persisted
 // the chat to the SD card.
 static fs::FS* s_ui_data_fs       = nullptr;
@@ -23379,77 +23419,82 @@ static File uiDataOpen(const char* name, const char* mode) {
   return s_ui_data_fs->open(p, mode);
 }
 
-bool UITask::loadHistoryFromStorage() {
+// Shared helper: read one on-disk record into a zero-initialized current-layout
+// struct, skipping any surplus tail bytes from a newer (longer) record.
+static bool readHistoryRec(File& f, void* dst, size_t cur_sz, size_t disk_sz) {
+  memset(dst, 0, cur_sz);
+  const size_t take = disk_sz < cur_sz ? disk_sz : cur_sz;
+  if (f.readBytes(reinterpret_cast<char*>(dst), take) != static_cast<int>(take)) return false;
+  if (disk_sz > cur_sz && !f.seek(f.position() + (disk_sz - cur_sz))) return false;
+  return true;
+}
+
+bool UITask::loadThreadsFromStorage() {
 #if defined(ESP32)
-  File f = uiDataOpen(k_ui_history_path, "r");
+  File f = uiDataOpen(k_ui_threads_path, "r");
   if (!f) return false;
 
   UiHistoryHeader hdr{};
-  if (f.readBytes(reinterpret_cast<char*>(&hdr), sizeof(hdr)) != static_cast<int>(sizeof(hdr))) {
-    f.close();
-    return false;
+  if (f.readBytes(reinterpret_cast<char*>(&hdr), sizeof(hdr)) != static_cast<int>(sizeof(hdr)) ||
+      hdr.magic != k_ui_threads_magic ||
+      hdr.version < k_ui_history_min_version || hdr.version > k_ui_history_version) {
+    f.close(); return false;
   }
-  if (hdr.magic != k_ui_history_magic ||
-      hdr.version < k_ui_history_min_version || hdr.version > k_ui_history_version ||
-      hdr.ui_msg_count > MAX_UI_MESSAGES || hdr.ui_msg_head >= MAX_UI_MESSAGES) {
-    f.close();
-    return false;
-  }
-
-  // On-disk record sizes. v5+ stores them so a blob written by an older build
-  // (shorter records — fields appended since) still loads: we read the stored
-  // size and leave the appended tail zeroed. A v4 blob predates these fields
-  // but shares the current record layout, so fall back to sizeof(). Reject
-  // absurd sizes from a corrupt blob.
-  const size_t disk_thread_sz =
+  const size_t disk_sz =
       (hdr.version >= 5 && hdr.thread_rec_size) ? hdr.thread_rec_size : sizeof(UiHistoryThread);
-  const size_t disk_msg_sz =
-      (hdr.version >= 5 && hdr.msg_rec_size) ? hdr.msg_rec_size : sizeof(UiHistoryMsg);
-  if (disk_thread_sz == 0 || disk_thread_sz > 4096 ||
-      disk_msg_sz == 0 || disk_msg_sz > 4096) {
-    f.close();
-    return false;
-  }
-
-  // Read one on-disk record into a zero-initialized current-layout struct:
-  // keep min(disk_sz, cur_sz) bytes, skip any surplus tail of a newer record.
-  // Older blobs leave the appended tail zeroed; newer blobs are truncated to
-  // what this build understands.
-  auto readRec = [&](void* dst, size_t cur_sz, size_t disk_sz) -> bool {
-    memset(dst, 0, cur_sz);
-    const size_t take = disk_sz < cur_sz ? disk_sz : cur_sz;
-    if (f.readBytes(reinterpret_cast<char*>(dst), take) != static_cast<int>(take)) return false;
-    if (disk_sz > cur_sz && !f.seek(f.position() + (disk_sz - cur_sz))) return false;
-    return true;
-  };
+  if (disk_sz == 0 || disk_sz > 4096) { f.close(); return false; }
 
   UiHistoryThread t{};
   for (int i = 0; i < MAX_UI_THREADS; ++i) {
-    if (!readRec(&t, sizeof(t), disk_thread_sz)) {
-      f.close();
-      return false;
-    }
-    _ui_threads[i].used = t.used != 0;
-    _ui_threads[i].channel = t.channel != 0;
-    _ui_threads[i].unread = t.unread;
-    _ui_threads[i].last_ts = t.last_ts;
-    _ui_threads[i].mesh_contact_idx = t.mesh_contact_idx;
-    memcpy(_ui_threads[i].mesh_contact_pub, t.mesh_contact_pub, sizeof(t.mesh_contact_pub));
+    if (!readHistoryRec(f, &t, sizeof(t), disk_sz)) { f.close(); return false; }
+    _ui_threads[i].used              = t.used != 0;
+    _ui_threads[i].channel           = t.channel != 0;
+    _ui_threads[i].unread            = t.unread;
+    _ui_threads[i].last_ts           = t.last_ts;
+    _ui_threads[i].mesh_contact_idx  = t.mesh_contact_idx;
+    memcpy(_ui_threads[i].mesh_contact_pub,  t.mesh_contact_pub,  sizeof(t.mesh_contact_pub));
     memcpy(_ui_threads[i].mesh_contact_key6, t.mesh_contact_key6, sizeof(t.mesh_contact_key6));
     _ui_threads[i].mesh_channel_slot = t.mesh_channel_slot;
     strncpy(_ui_threads[i].name, t.name, MAX_THREAD_NAME);
     _ui_threads[i].name[MAX_THREAD_NAME] = '\0';
   }
+  f.close();
+
+  _active_thread_idx        = hdr.active_thread_idx;
+  _active_thread_is_channel = hdr.active_thread_is_channel != 0;
+  if (_active_thread_idx < 0 || _active_thread_idx >= MAX_UI_THREADS ||
+      !_ui_threads[_active_thread_idx].used) {
+    _active_thread_idx = -1;
+    _active_thread_is_channel = false;
+  }
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool UITask::loadMsgsFromStorage() {
+#if defined(ESP32)
+  File f = uiDataOpen(k_ui_msgs_path, "r");
+  if (!f) return false;
+
+  UiMsgFileHeader hdr{};
+  if (f.readBytes(reinterpret_cast<char*>(&hdr), sizeof(hdr)) != static_cast<int>(sizeof(hdr)) ||
+      hdr.magic != k_ui_msgs_magic ||
+      hdr.version < k_ui_history_min_version || hdr.version > k_ui_history_version ||
+      hdr.ui_msg_count > MAX_UI_MESSAGES || hdr.ui_msg_head >= MAX_UI_MESSAGES) {
+    f.close(); return false;
+  }
+  const size_t disk_sz =
+      (hdr.version >= 5 && hdr.msg_rec_size) ? hdr.msg_rec_size : sizeof(UiHistoryMsg);
+  if (disk_sz == 0 || disk_sz > 4096) { f.close(); return false; }
 
   UiHistoryMsg m{};
   for (int i = 0; i < MAX_UI_MESSAGES; ++i) {
-    if (!readRec(&m, sizeof(m), disk_msg_sz)) {
-      f.close();
-      return false;
-    }
-    _ui_msgs[i].ts = m.ts;
-    _ui_msgs[i].channel = m.channel != 0;
-    _ui_msgs[i].outgoing = m.outgoing != 0;
+    if (!readHistoryRec(f, &m, sizeof(m), disk_sz)) { f.close(); return false; }
+    _ui_msgs[i].ts        = m.ts;
+    _ui_msgs[i].channel   = m.channel != 0;
+    _ui_msgs[i].outgoing  = m.outgoing != 0;
     _ui_msgs[i].meta_flags = m.meta_flags;
     _ui_msgs[i].path_len   = m.path_len;
     _ui_msgs[i].snr_q4     = m.snr_q4;
@@ -23464,9 +23509,93 @@ bool UITask::loadHistoryFromStorage() {
   f.close();
 
   _ui_msg_count = hdr.ui_msg_count;
-  _ui_msg_head = hdr.ui_msg_head;
-  _msgcount = static_cast<int>(hdr.msgcount);
-  _active_thread_idx = hdr.active_thread_idx;
+  _ui_msg_head  = hdr.ui_msg_head;
+  _msgcount     = static_cast<int>(hdr.msgcount);
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool UITask::loadLegacyHistoryFromStorage() {
+#if defined(ESP32)
+  File f = uiDataOpen(k_ui_history_path, "r");
+  if (!f) return false;
+
+  UiHistoryHeader hdr{};
+  if (f.readBytes(reinterpret_cast<char*>(&hdr), sizeof(hdr)) != static_cast<int>(sizeof(hdr))) {
+    f.close(); return false;
+  }
+  if (hdr.magic != k_ui_history_magic ||
+      hdr.version < k_ui_history_min_version || hdr.version > k_ui_history_version ||
+      hdr.ui_msg_count > MAX_UI_MESSAGES || hdr.ui_msg_head >= MAX_UI_MESSAGES) {
+    f.close(); return false;
+  }
+
+  // On-disk record sizes. v5+ stores them so a blob written by an older build
+  // (shorter records — fields appended since) still loads: we read the stored
+  // size and leave the appended tail zeroed. A v4 blob predates these fields
+  // but shares the current record layout, so fall back to sizeof(). Reject
+  // absurd sizes from a corrupt blob.
+  const size_t disk_thread_sz =
+      (hdr.version >= 5 && hdr.thread_rec_size) ? hdr.thread_rec_size : sizeof(UiHistoryThread);
+  const size_t disk_msg_sz =
+      (hdr.version >= 5 && hdr.msg_rec_size) ? hdr.msg_rec_size : sizeof(UiHistoryMsg);
+  if (disk_thread_sz == 0 || disk_thread_sz > 4096 ||
+      disk_msg_sz == 0 || disk_msg_sz > 4096) {
+    f.close(); return false;
+  }
+
+  UiHistoryThread t{};
+  for (int i = 0; i < MAX_UI_THREADS; ++i) {
+    if (!readHistoryRec(f, &t, sizeof(t), disk_thread_sz)) { f.close(); return false; }
+    _ui_threads[i].used              = t.used != 0;
+    _ui_threads[i].channel           = t.channel != 0;
+    _ui_threads[i].unread            = t.unread;
+    _ui_threads[i].last_ts           = t.last_ts;
+    _ui_threads[i].mesh_contact_idx  = t.mesh_contact_idx;
+    memcpy(_ui_threads[i].mesh_contact_pub,  t.mesh_contact_pub,  sizeof(t.mesh_contact_pub));
+    memcpy(_ui_threads[i].mesh_contact_key6, t.mesh_contact_key6, sizeof(t.mesh_contact_key6));
+    _ui_threads[i].mesh_channel_slot = t.mesh_channel_slot;
+    strncpy(_ui_threads[i].name, t.name, MAX_THREAD_NAME);
+    _ui_threads[i].name[MAX_THREAD_NAME] = '\0';
+  }
+
+  // The legacy file was written when MAX_UI_MESSAGES was smaller (96). Derive
+  // how many message slots are actually present from the remaining file bytes so
+  // we don't try to read past EOF when the ring has grown. Slots beyond the
+  // legacy count are left zero — the reconciliation pass below will clear any
+  // unread counts whose messages were already evicted.
+  const size_t bytes_after_threads = f.size() > f.position() ? f.size() - f.position() : 0;
+  const int legacy_slots = (int)(bytes_after_threads / disk_msg_sz);
+
+  UiHistoryMsg m{};
+  for (int i = 0; i < MAX_UI_MESSAGES; ++i) {
+    if (i < legacy_slots) {
+      if (!readHistoryRec(f, &m, sizeof(m), disk_msg_sz)) { f.close(); return false; }
+      _ui_msgs[i].ts        = m.ts;
+      _ui_msgs[i].channel   = m.channel != 0;
+      _ui_msgs[i].outgoing  = m.outgoing != 0;
+      _ui_msgs[i].meta_flags = m.meta_flags;
+      _ui_msgs[i].path_len   = m.path_len;
+      _ui_msgs[i].snr_q4     = m.snr_q4;
+      _ui_msgs[i].rssi       = m.rssi;
+      strncpy(_ui_msgs[i].thread, m.thread, MAX_THREAD_NAME);
+      _ui_msgs[i].thread[MAX_THREAD_NAME] = '\0';
+      strncpy(_ui_msgs[i].sender, m.sender, MAX_SENDER_NAME);
+      _ui_msgs[i].sender[MAX_SENDER_NAME] = '\0';
+      strncpy(_ui_msgs[i].text, m.text, MAX_MSG_TEXT);
+      _ui_msgs[i].text[MAX_MSG_TEXT] = '\0';
+    } else {
+      _ui_msgs[i] = UIMessage{};
+    }
+  }
+  f.close();
+
+  _ui_msg_count             = hdr.ui_msg_count;
+  _ui_msg_head              = hdr.ui_msg_head;
+  _msgcount                 = static_cast<int>(hdr.msgcount);
+  _active_thread_idx        = hdr.active_thread_idx;
   _active_thread_is_channel = hdr.active_thread_is_channel != 0;
   if (_active_thread_idx < 0 || _active_thread_idx >= MAX_UI_THREADS ||
       !_ui_threads[_active_thread_idx].used) {
@@ -23479,63 +23608,107 @@ bool UITask::loadHistoryFromStorage() {
 #endif
 }
 
-bool UITask::saveHistoryToStorage() {
+bool UITask::loadHistoryFromStorage() {
 #if defined(ESP32)
-  // Write from internal-RAM stack structs (fast). NOTE: do NOT "optimize"
-  // this into a single big write from a PSRAM buffer — the flash driver has
-  // to bounce a PSRAM source through internal RAM chunk-by-chunk, which is
-  // SLOWER than these per-struct writes and was a real regression. Keep the
-  // write synchronous + prompt (called right after each message) so a
-  // hardware reset doesn't lose the chat — that's what the released build did
-  // and it was reliable.
-  WdtHeavyGuard _wg;   // a fragmenting history write can trigger a multi-second SPIFFS GC
-  File f = uiDataOpen(k_ui_history_path, "w");
+  const bool have_threads = loadThreadsFromStorage();
+  const bool have_msgs    = loadMsgsFromStorage();
+  if (!have_threads && !have_msgs) {
+    // Neither split file found — try the legacy combined format for migration.
+    if (!loadLegacyHistoryFromStorage()) return false;
+    // Schedule writes of the new split files; old file is left in place.
+    markThreadsDirty(500);
+    markMsgsDirty(500);
+  }
+  // Clear persisted unread counts for threads whose messages are no longer in
+  // the ring. The display ring is a fixed-size cache independent of the unread
+  // counter; if the device rebooted after ring overflow the counter can be
+  // non-zero while the ring holds nothing for that thread, producing a phantom
+  // badge that opens to an empty chat. Resetting here is safe: the user never
+  // saw those messages anyway (ring had already evicted them before the save).
+  for (int i = 0; i < MAX_UI_THREADS; ++i) {
+    if (_ui_threads[i].used && _ui_threads[i].unread > 0 &&
+        !threadHasMessageHistory(i)) {
+      _ui_threads[i].unread = 0;
+      _ui_threads[i].has_mention = false;
+    }
+  }
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool UITask::saveThreadsToStorage() {
+#if defined(ESP32)
+  WdtHeavyGuard _wg;
+  File f = uiDataOpen(k_ui_threads_path, "w");
   if (!f) return false;
 
   UiHistoryHeader hdr{};
-  hdr.magic = k_ui_history_magic;
-  hdr.version = k_ui_history_version;
-  hdr.thread_rec_size = static_cast<uint16_t>(sizeof(UiHistoryThread));
-  hdr.msg_rec_size = static_cast<uint16_t>(sizeof(UiHistoryMsg));
-  hdr.ui_msg_count = static_cast<uint16_t>(_ui_msg_count);
-  hdr.ui_msg_head = static_cast<uint16_t>(_ui_msg_head);
-  hdr.msgcount = static_cast<uint32_t>(_msgcount);
-  hdr.active_thread_idx = static_cast<int16_t>(_active_thread_idx);
+  hdr.magic                 = k_ui_threads_magic;
+  hdr.version               = k_ui_history_version;
+  hdr.thread_rec_size       = static_cast<uint16_t>(sizeof(UiHistoryThread));
+  hdr.active_thread_idx     = static_cast<int16_t>(_active_thread_idx);
   hdr.active_thread_is_channel = _active_thread_is_channel ? 1u : 0u;
   if (f.write(reinterpret_cast<const uint8_t*>(&hdr), sizeof(hdr)) != sizeof(hdr)) {
-    f.close();
-    return false;
+    f.close(); return false;
   }
 
   UiHistoryThread t{};
   for (int i = 0; i < MAX_UI_THREADS; ++i) {
     memset(&t, 0, sizeof(t));
-    t.used = _ui_threads[i].used ? 1u : 0u;
-    t.channel = _ui_threads[i].channel ? 1u : 0u;
-    t.unread = _ui_threads[i].unread;
-    t.last_ts = _ui_threads[i].last_ts;
-    t.mesh_contact_idx = _ui_threads[i].mesh_contact_idx;
-    memcpy(t.mesh_contact_pub, _ui_threads[i].mesh_contact_pub, sizeof(t.mesh_contact_pub));
+    t.used               = _ui_threads[i].used ? 1u : 0u;
+    t.channel            = _ui_threads[i].channel ? 1u : 0u;
+    t.unread             = _ui_threads[i].unread;
+    t.last_ts            = _ui_threads[i].last_ts;
+    t.mesh_contact_idx   = _ui_threads[i].mesh_contact_idx;
+    memcpy(t.mesh_contact_pub,  _ui_threads[i].mesh_contact_pub,  sizeof(t.mesh_contact_pub));
     memcpy(t.mesh_contact_key6, _ui_threads[i].mesh_contact_key6, sizeof(t.mesh_contact_key6));
-    t.mesh_channel_slot = _ui_threads[i].mesh_channel_slot;
+    t.mesh_channel_slot  = _ui_threads[i].mesh_channel_slot;
     strncpy(t.name, _ui_threads[i].name, MAX_THREAD_NAME);
     t.name[MAX_THREAD_NAME] = '\0';
     if (f.write(reinterpret_cast<const uint8_t*>(&t), sizeof(t)) != sizeof(t)) {
-      f.close();
-      return false;
+      f.close(); return false;
     }
+  }
+  f.close();
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool UITask::saveMsgsToStorage() {
+#if defined(ESP32)
+  // Write from internal-RAM stack structs (fast). NOTE: do NOT "optimize"
+  // this into a single big write from a PSRAM buffer — the flash driver has
+  // to bounce a PSRAM source through internal RAM chunk-by-chunk, which is
+  // SLOWER than these per-struct writes and was a real regression.
+  WdtHeavyGuard _wg;   // a fragmenting write can trigger a multi-second SPIFFS GC
+  File f = uiDataOpen(k_ui_msgs_path, "w");
+  if (!f) return false;
+
+  UiMsgFileHeader hdr{};
+  hdr.magic         = k_ui_msgs_magic;
+  hdr.version       = k_ui_history_version;
+  hdr.msg_rec_size  = static_cast<uint16_t>(sizeof(UiHistoryMsg));
+  hdr.ui_msg_count  = static_cast<uint16_t>(_ui_msg_count);
+  hdr.ui_msg_head   = static_cast<uint16_t>(_ui_msg_head);
+  hdr.msgcount      = static_cast<uint32_t>(_msgcount);
+  if (f.write(reinterpret_cast<const uint8_t*>(&hdr), sizeof(hdr)) != sizeof(hdr)) {
+    f.close(); return false;
   }
 
   UiHistoryMsg m{};
   for (int i = 0; i < MAX_UI_MESSAGES; ++i) {
     memset(&m, 0, sizeof(m));
-    m.ts = _ui_msgs[i].ts;
-    m.channel = _ui_msgs[i].channel ? 1u : 0u;
-    m.outgoing = _ui_msgs[i].outgoing ? 1u : 0u;
-    m.meta_flags = _ui_msgs[i].meta_flags;
-    m.path_len   = _ui_msgs[i].path_len;
-    m.snr_q4     = _ui_msgs[i].snr_q4;
-    m.rssi       = _ui_msgs[i].rssi;
+    m.ts          = _ui_msgs[i].ts;
+    m.channel     = _ui_msgs[i].channel ? 1u : 0u;
+    m.outgoing    = _ui_msgs[i].outgoing ? 1u : 0u;
+    m.meta_flags  = _ui_msgs[i].meta_flags;
+    m.path_len    = _ui_msgs[i].path_len;
+    m.snr_q4      = _ui_msgs[i].snr_q4;
+    m.rssi        = _ui_msgs[i].rssi;
     strncpy(m.thread, _ui_msgs[i].thread, MAX_THREAD_NAME);
     m.thread[MAX_THREAD_NAME] = '\0';
     strncpy(m.sender, _ui_msgs[i].sender, MAX_SENDER_NAME);
@@ -23543,8 +23716,7 @@ bool UITask::saveHistoryToStorage() {
     strncpy(m.text, _ui_msgs[i].text, MAX_MSG_TEXT);
     m.text[MAX_MSG_TEXT] = '\0';
     if (f.write(reinterpret_cast<const uint8_t*>(&m), sizeof(m)) != sizeof(m)) {
-      f.close();
-      return false;
+      f.close(); return false;
     }
   }
   f.close();
@@ -23607,15 +23779,14 @@ bool UITask::removeThread(int idx) {
   _ui_threads[idx].mesh_contact_idx  = -1;
   _ui_threads[idx].mesh_channel_slot = -1;
   if (_active_thread_idx == idx) _active_thread_idx = -1;
-  // Flush immediately. markHistoryDirty(200) would normally be lazy, and
-  // flushHistoryIfDue further defers writes by 2 s while the user is on the
-  // chat inbox — so if they reboot in that window, the on-disk thread list
-  // still contained the deleted thread and the channel/DM came back.
-  if (!saveHistoryToStorage()) {
-    _history_dirty = true;
-    _next_history_flush_ms = millis() + 200;
+  // Flush thread metadata immediately — markThreadsDirty(200) would be lazy,
+  // and flushHistoryIfDue further defers writes while the user is on the inbox,
+  // so a reboot in that window would resurrect the deleted thread.
+  if (!saveThreadsToStorage()) {
+    _threads_dirty = true;
+    _next_threads_flush_ms = millis() + 200;
   } else {
-    _history_dirty = false;
+    _threads_dirty = false;
   }
   return true;
 }
@@ -23853,7 +24024,7 @@ int UITask::appendMessage(const char* thread, const char* sender, const char* te
     _ui_threads[t_idx].has_mention = true;   // blue @ on the inbox row
   }
   ++_msgcount;
-  markHistoryDirty();
+  markMsgsDirty();
   return t_idx;
 }
 
@@ -23973,7 +24144,7 @@ void UITask::setActiveThread(int idx, bool channel_mode) {
   s_chat_just_opened = true;
   _ui_threads[idx].unread    = 0;
   _ui_threads[idx].has_mention = false;
-  if (was_unread) markHistoryDirty(200);   // persist the read state (survives a manual reboot)
+  if (was_unread) markThreadsDirty(200);   // persist the read state (survives a manual reboot)
   if (channel_mode) {
     _active_dm_contact_set = false;
     memset(_active_dm_contact_pub, 0, sizeof(_active_dm_contact_pub));
@@ -24001,7 +24172,7 @@ void UITask::setActiveThread(int idx, bool channel_mode) {
   // full SPIFFS write on every chat-open is pure overhead and was the
   // "freeze when opening a chat" hitch. The unread-clear persists on the
   // next message save or on reboot; message content already persists on
-  // send/receive (appendMessage -> markHistoryDirty).
+  // send/receive (appendMessage -> markMsgsDirty).
 }
 
 void UITask::resetComposer() {
@@ -24448,8 +24619,10 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   // decoding — auto-add is purely contact-list behaviour). Removed: the user's
   // saved Auto-add configuration is now respected as-is across reboots. Fresh
   // installs still get sensible defaults from the firmware's pref initialisation.
-  _history_dirty = false;
-  _next_history_flush_ms = 0;
+  _threads_dirty = false;
+  _next_threads_flush_ms = 0;
+  _msgs_dirty = false;
+  _next_msgs_flush_ms = 0;
   loadHistoryFromStorage();
   _next_mesh_thread_refresh = millis() + 2000;
   refreshThreadsFromMesh();
@@ -24652,7 +24825,7 @@ void UITask::markThreadRead(int idx) {
   if (_ui_threads[idx].unread == 0 && !_ui_threads[idx].has_mention) return;
   _ui_threads[idx].unread = 0;
   _ui_threads[idx].has_mention = false;
-  markHistoryDirty(200);   // persist soon (survives a manual reboot)
+  markThreadsDirty(200);   // persist soon (survives a manual reboot)
 }
 
 // Clear unread for the thread whose detail is currently open. refreshChatDetail
@@ -24677,7 +24850,7 @@ void UITask::markAllThreadsRead() {
       any = true;
     }
   }
-  if (any) markHistoryDirty(200);   // persist soon (survives a manual reboot)
+  if (any) markThreadsDirty(200);   // persist soon (survives a manual reboot)
 }
 
 bool UITask::threadHasMention(int idx) const {
@@ -24797,7 +24970,7 @@ void UITask::openMeshContactDm(uint32_t mesh_contact_index) {
   memcpy(_ui_threads[t].mesh_contact_key6, c.id.pub_key, sizeof(_ui_threads[t].mesh_contact_key6));
   _active_dm_contact_set = true;
   memcpy(_active_dm_contact_pub, c.id.pub_key, sizeof(_active_dm_contact_pub));
-  markHistoryDirty(200);
+  markThreadsDirty(200);
   setActiveThread(t, false);
 #if defined(HAS_TOUCH_UI)
   if (!g_lv.ready) {
@@ -25185,14 +25358,16 @@ bool UITask::sendAdvertFlood() { return the_mesh.sendAdvert(true); }
 bool UITask::sendAdvertZeroHop() { return the_mesh.sendAdvert(false); }
 
 void UITask::persistHistoryNow() {
-  saveHistoryToStorage();
+  saveThreadsToStorage();
+  saveMsgsToStorage();
 }
 
 void UITask::rebootDevice() {
   // Persist chat history synchronously before we reboot — the periodic
-  // flush is off-thread and rate-capped, so without this a reboot could
-  // drop the most recent (or, if it never flushed, all) chat history.
-  if (_history_dirty) saveHistoryToStorage();
+  // flush is rate-capped, so without this a reboot could drop the most
+  // recent chat history.
+  if (_threads_dirty) saveThreadsToStorage();
+  if (_msgs_dirty) saveMsgsToStorage();
   discoveredFlushNow();   // persist the Discovered ring before we go down
   if (_board) _board->reboot();
 }
@@ -25788,7 +25963,8 @@ void UITask::setBootPhase(const char* label) {
 void UITask::shutdown(bool restart) {
   (void)restart;
   // Flush chat history before we go down.
-  if (_history_dirty) saveHistoryToStorage();
+  if (_threads_dirty) saveThreadsToStorage();
+  if (_msgs_dirty) saveMsgsToStorage();
   if (_display) {
     _display->startFrame();
     _display->drawTextCentered(_display->width() / 2, _display->height() / 2, "Shutting down...");
