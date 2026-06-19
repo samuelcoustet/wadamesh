@@ -757,9 +757,11 @@ static int      s_diag_line  = 0;
 static char     s_diag_id_pinned[DIAG_COLS] = { 0 };
 constexpr int RXLOG_LINES = 28;
 constexpr int RXLOG_COLS  = 80;
-static char s_rxlog_ring[RXLOG_LINES][RXLOG_COLS];
+// Monitor RX/RAW rings — lazy PSRAM (allocated in begin(), internal fallback):
+// keeps 2×28×80 = 4.4 KB off internal DRAM. Null-guarded in the helpers below.
+static char (*s_rxlog_ring)[RXLOG_COLS] = nullptr;
 static int s_rxlog_line = 0;
-static char s_rawlog_ring[RXLOG_LINES][RXLOG_COLS];
+static char (*s_rawlog_ring)[RXLOG_COLS] = nullptr;
 static int s_rawlog_line = 0;
 static lv_obj_t* s_live_diag_label = nullptr;
 static uint32_t  s_live_diag_reads = 0;
@@ -921,7 +923,13 @@ static const uint8_t   DISC_BLOB_VER  = 1;
 static constexpr size_t DISC_REC_SZ    = PUB_KEY_SIZE + 32 + 4 + 16;   // pubkey + name + 4×u8 + 4×u32
 static constexpr int    DISC_PER_CHUNK = 24;                           // 2 + 24*84 = 2018 B < 2048 cap
 static constexpr int    DISC_CHUNKS    = (DISCOVERED_MAX + DISC_PER_CHUNK - 1) / DISC_PER_CHUNK;
-static uint8_t s_disc_blob[2 + DISC_PER_CHUNK * DISC_REC_SZ];
+static constexpr size_t DISC_BLOB_SZ = 2 + DISC_PER_CHUNK * DISC_REC_SZ;
+static uint8_t* s_disc_blob = nullptr;   // Discovered-ring persistence scratch — lazy PSRAM (internal fallback): ~2 KB off internal DRAM
+static uint8_t* discBlob() {             // alloc on first save/load; returns null only on (unlikely) OOM
+  if (!s_disc_blob) { s_disc_blob = (uint8_t*)heap_caps_malloc(DISC_BLOB_SZ, MALLOC_CAP_SPIRAM);
+                      if (!s_disc_blob) s_disc_blob = (uint8_t*)heap_caps_malloc(DISC_BLOB_SZ, MALLOC_CAP_8BIT); }
+  return s_disc_blob;
+}
 static inline void     discPutU32(uint8_t*& p, uint32_t v) { p[0]=(uint8_t)v; p[1]=(uint8_t)(v>>8); p[2]=(uint8_t)(v>>16); p[3]=(uint8_t)(v>>24); p+=4; }
 static inline uint32_t discGetU32(const uint8_t*& p) { uint32_t v=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24); p+=4; return v; }
 static void discChunkKey(int chunk, char* out, size_t cap) {
@@ -929,7 +937,7 @@ static void discChunkKey(int chunk, char* out, size_t cap) {
   else            { snprintf(out, cap, "disc%d", chunk); }
 }
 static void saveDiscovered() {
-  if (!s_discovered) return;
+  if (!s_discovered || !discBlob()) return;
   int src = 0;   // walk the ring once, emitting used entries into successive chunk blobs
   for (int chunk = 0; chunk < DISC_CHUNKS; ++chunk) {
     uint8_t* p = s_disc_blob;
@@ -959,12 +967,12 @@ static void saveDiscovered() {
   s_disc_dirty = false;
 }
 static void loadDiscovered() {
-  if (!s_discovered) return;
+  if (!s_discovered || !discBlob()) return;
   memset(s_discovered, 0, sizeof(LvDiscoveredEntry) * DISCOVERED_MAX);
   int dst = 0;
   for (int chunk = 0; chunk < DISC_CHUNKS && dst < DISCOVERED_MAX; ++chunk) {
     char key[8]; discChunkKey(chunk, key, sizeof key);
-    size_t got = touchPrefsGetBlob(key, s_disc_blob, sizeof(s_disc_blob));
+    size_t got = touchPrefsGetBlob(key, s_disc_blob, DISC_BLOB_SZ);
     if (got < 2 || s_disc_blob[0] != DISC_BLOB_VER) continue;   // missing / garbage chunk -> skip
     uint8_t count = s_disc_blob[1];
     const uint8_t* p   = s_disc_blob + 2;
@@ -1405,7 +1413,7 @@ static void styleButton(lv_obj_t* obj) {
 // IMPORTANT: each caller is responsible for keeping the top-right ~32×32
 // of the card content-free (or for placing only short titles there) so
 // the X doesn't sit on top of a real button.
-static void addCloseXBadge(lv_obj_t* card, lv_event_cb_t cb, void* user_data = nullptr) {
+static lv_obj_t* addCloseXBadge(lv_obj_t* card, lv_event_cb_t cb, void* user_data = nullptr) {
   lv_obj_t* x = lv_obj_create(card);
   lv_obj_remove_style_all(x);
   lv_obj_set_size(x, 32, 32);
@@ -1435,6 +1443,7 @@ static void addCloseXBadge(lv_obj_t* card, lv_event_cb_t cb, void* user_data = n
   // nothing. The 32×32 hit zone still extends down/left for an easy tap,
   // but visually the glyph occupies the corner of the popup card.
   lv_obj_align(lbl, LV_ALIGN_TOP_RIGHT, -6, 4);
+  return x;
 }
 
 // ============================================================
@@ -1615,6 +1624,7 @@ static void logModeRawCb(lv_event_t* e);
 static void showConfirm(const char* msg, const char* ok_label, void (*on_confirm)());
 static void clipboardSet(const char* text, const char* tag);
 static void copyLabelLongPressCb(lv_event_t* e);
+static void taClearSelection(lv_obj_t* ta);   // clear composer text-selection before an insert
 static lv_obj_t* createSettingsModal(const char* title, SettingsModalKind kind);
 static void chatDeleteApply();
 static void shareMyContactBtnCb(lv_event_t* e);
@@ -3372,10 +3382,11 @@ static void qrPickCb(lv_event_t* e) {
   char buf[TOUCH_QUICK_REPLY_MAXLEN];
   int n = touchPrefsGetQuickReply((int)idx, buf, sizeof(buf));
   if (n <= 0) return;
-  // Append at the cursor (NOT set_text) so a quick-reply tapped after an
-  // "@[name] " mention adds to it instead of wiping the address — matches the
-  // @-mention insert path. No auto-send: lets the operator tweak before the
-  // send button (a stray tap blasting a macro is worse UX than an extra tap).
+  // Insert at the cursor (NOT set_text) so a quick-reply tapped after some typed
+  // text adds to it instead of wiping it. Clear any active text-selection first —
+  // otherwise lv_textarea_add_text REPLACES the selection (that was the "quick
+  // reply wipes what I typed" report). No auto-send: lets the operator tweak first.
+  taClearSelection(p->composer_ta);
   lv_textarea_add_text(p->composer_ta, buf);
   // Move keyboard focus to the textarea so a quick send tap works next.
   lv_obj_add_state(p->composer_ta, LV_STATE_FOCUSED);
@@ -11672,10 +11683,13 @@ static bool fmCopyFile(fs::FS* sf, const char* sp, fs::FS* df, const char* dp) {
   if (!in) return false;
   File out = df->open(dp, "w");
   if (!out) { in.close(); return false; }
-  static uint8_t buf[2048];
+  static uint8_t* buf = nullptr;   // copy scratch — lazy PSRAM (internal fallback): ~2 KB off internal DRAM
+  if (!buf) { buf = (uint8_t*)heap_caps_malloc(2048, MALLOC_CAP_SPIRAM);
+              if (!buf) buf = (uint8_t*)heap_caps_malloc(2048, MALLOC_CAP_8BIT); }
+  if (!buf) { out.close(); in.close(); return false; }
   bool ok = true;
   int n;
-  while ((n = in.read(buf, sizeof buf)) > 0) {
+  while ((n = in.read(buf, 2048)) > 0) {
     if (out.write(buf, (size_t)n) != (size_t)n) { ok = false; break; }
     feedLoopWDT();
   }
@@ -14540,10 +14554,16 @@ static int tjpgOutCb(JDEC* jd, void* bitmap, JRECT* r) {
 static uint8_t* decodeJpegScaledToRgb565(const uint8_t* jpeg, size_t jpeg_len,
                                          int* out_w, int* out_h, int max_dim) {
   s_jpgScaleErr[0] = '\0';
-  static uint8_t pool[4096];   // tjpgd work area (JD_FASTDECODE=0 ~3.1 KB); matches LVGL's TJPGD_WORKBUFF_SIZE
+  // tjpgd work area (~3.1 KB used). Lazy PSRAM (internal fallback), cached — keeps
+  // this ~4 KB out of scarce internal DRAM. JD_FASTDECODE=0; matches LVGL's TJPGD_WORKBUFF_SIZE.
+  static const size_t kJpgWork = 4096;
+  static uint8_t* pool = nullptr;
+  if (!pool) { pool = (uint8_t*)heap_caps_malloc(kJpgWork, MALLOC_CAP_SPIRAM);
+               if (!pool) pool = (uint8_t*)heap_caps_malloc(kJpgWork, MALLOC_CAP_8BIT); }
+  if (!pool) { snprintf(s_jpgScaleErr, sizeof s_jpgScaleErr, "Out of memory."); return nullptr; }
   TjpgIo io; io.data = jpeg; io.len = jpeg_len; io.pos = 0; io.out = nullptr; io.ow = 0; io.oh = 0;
   JDEC jd;
-  JRESULT rp = jd_prepare(&jd, tjpgInCb, pool, sizeof pool, &io);
+  JRESULT rp = jd_prepare(&jd, tjpgInCb, pool, kJpgWork, &io);
   if (rp != JDR_OK) {
     if (rp == JDR_FMT3 || rp == JDR_FMT2)   // tjpgd can't decode progressive / unusual-sampling JPEGs
       snprintf(s_jpgScaleErr, sizeof s_jpgScaleErr, "Progressive JPEG.\nRe-save as a standard JPEG.");
@@ -14580,6 +14600,8 @@ static double   s_map_center_lat = 0.0;
 static double   s_map_center_lon = 0.0;
 static uint8_t  s_map_zoom       = k_map_zoom_default;
 static bool     s_map_view_inited = false;  // first map open did the recenter+zoom-snap; after that, remember the user's view (issue #5)
+static bool       s_map_follow     = false; // auto-follow: recenter on self whenever the GPS coords change
+static lv_obj_t*  s_map_follow_btn = nullptr;
 static bool     s_map_has_pack   = false;   // toggles placeholder visibility
 
 // lat/lon → world pixel at given zoom (Web Mercator).
@@ -15597,6 +15619,25 @@ static bool       s_map_show_links = true;
 static lv_obj_t*  s_map_link_objs[k_map_markers_max] = {};
 static lv_point_t s_map_link_pts[k_map_markers_max][2];
 
+// Per-element visibility of the map's on-screen text/markers (persisted; all
+// default shown). Coords = bottom-left read-out, TileXYZ = the zoom + tile path
+// line, Contacts = the contact markers.
+static bool s_map_show_coords   = true;
+static bool s_map_show_tilexyz  = true;
+static bool s_map_show_contacts = true;
+
+// Apply the coords/tile-line visibility flags to the two corner labels. Safe to
+// call before the labels exist (null-guarded); invoked at map build + on toggle.
+static void applyMapTextVis() {
+  auto vis = [](lv_obj_t* o, bool show) {
+    if (!o) return;
+    if (show) lv_obj_clear_flag(o, LV_OBJ_FLAG_HIDDEN);
+    else      lv_obj_add_flag(o, LV_OBJ_FLAG_HIDDEN);
+  };
+  vis(s_map_info_lbl, s_map_show_coords);
+  vis(s_map_zoom_lbl, s_map_show_tilexyz);
+}
+
 // ----- Route replay overlay -----
 // "Replay" in a message's Info popup resolves that message's repeater hops to
 // their advertised positions and animates them onto the map as a path, one node
@@ -15678,7 +15719,7 @@ static void renderMapMarkers() {
 
   // ---- Dotted links from self to each on-screen contact (drawn first so the
   //      markers sit on top). Toggled by the on-map links button.
-  if (s_map_show_links && self_has) {
+  if (s_map_show_links && s_map_show_contacts && self_has) {   // links only make sense when contacts are shown
     auto clampc = [](int v) -> lv_coord_t {
       if (v < -2000) v = -2000;
       if (v >  2000) v =  2000;
@@ -15731,7 +15772,8 @@ static void renderMapMarkers() {
   // ---- Contact markers — colored circles sized for taps (14×14 with a
   //      2-px black border so they read on any tile background).
   int slot = 1;   // slot 0 reserved for self
-  for (uint32_t i = 0; i < the_mesh.getNumContacts() && slot < k_map_markers_max; ++i) {
+  // Contact markers — skipped entirely when "Contacts on map" is off (self stays).
+  for (uint32_t i = 0; s_map_show_contacts && i < the_mesh.getNumContacts() && slot < k_map_markers_max; ++i) {
     ContactInfo c;
     if (!the_mesh.getContactByIdx(i, c)) continue;
     if (c.gps_lat == 0 && c.gps_lon == 0) continue;
@@ -16131,6 +16173,33 @@ static void mapOptNightCb(lv_event_t* e) {
   applyMapChrome(true);  // re-tint the status bar + tab bar for the new tile brightness
 }
 
+// Per-element map text/marker visibility toggles. Coords + tile line just hide
+// their corner label; contacts re-renders the markers.
+static void mapOptCoordsCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  s_map_show_coords = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetMapShowCoords(s_map_show_coords);
+#endif
+  applyMapTextVis();
+}
+static void mapOptTileXYZCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  s_map_show_tilexyz = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetMapShowTileXYZ(s_map_show_tilexyz);
+#endif
+  applyMapTextVis();
+}
+static void mapOptContactsCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  s_map_show_contacts = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+#if defined(ESP32)
+  touchPrefsSetMapShowContacts(s_map_show_contacts);
+#endif
+  renderMapMarkers();   // add/remove the contact markers (+ their links)
+}
+
 #if defined(HAS_TDECK_GT911)
 // Map tile source toggle (in the map options popup): ON = read tiles off the microSD
 // (fully offline, no server fetch); OFF = tile server + on-device cache.
@@ -16291,34 +16360,9 @@ static void openMapOptions() {
   lv_obj_set_pos(title, 0, 0);
   int y = 26;
 
-  // Row: Lines toggle.
-  lv_obj_t* ll = lv_label_create(card);
-  lv_label_set_text(ll, TR("Show link lines"));
-  lv_obj_set_style_text_color(ll, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
-  lv_obj_set_style_text_font(ll, &g_font_14, LV_PART_MAIN);
-  lv_obj_set_pos(ll, 2, y + 4);
-  lv_obj_t* sw_lines = lv_switch_create(card);
-  lv_obj_align(sw_lines, LV_ALIGN_TOP_RIGHT, 0, y);
-  if (s_map_show_links) lv_obj_add_state(sw_lines, LV_STATE_CHECKED);
-  lv_obj_add_event_cb(sw_lines, mapOptLinesCb, LV_EVENT_VALUE_CHANGED, nullptr);
-  y += 40;
-
-  // Row: Night mode (invert tile colours).
-  {
-    lv_obj_t* nl = lv_label_create(card);
-    lv_label_set_text(nl, TR("Night mode (invert)"));
-    lv_obj_set_style_text_color(nl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
-    lv_obj_set_style_text_font(nl, &g_font_14, LV_PART_MAIN);
-    lv_obj_set_pos(nl, 2, y + 4);
-    lv_obj_t* sw_night = lv_switch_create(card);
-    lv_obj_align(sw_night, LV_ALIGN_TOP_RIGHT, 0, y);
-    if (s_map_night) lv_obj_add_state(sw_night, LV_STATE_CHECKED);
-    lv_obj_add_event_cb(sw_night, mapOptNightCb, LV_EVENT_VALUE_CHANGED, nullptr);
-    y += 40;
-  }
-
 #if defined(HAS_TDECK_GT911)
-  // Row: tile source — microSD (offline) vs the tile server.
+  // Row: tile source — microSD (offline) vs the tile server. The important one,
+  // so it sits at the very top.
   {
     lv_obj_t* tl = lv_label_create(card);
     lv_label_set_text(tl, TR("Tiles from SD card"));
@@ -16332,6 +16376,59 @@ static void openMapOptions() {
     y += 40;
   }
 #endif
+
+  // Row: Night mode (invert tile colours) — a tile/display setting, kept up top.
+  {
+    lv_obj_t* nl = lv_label_create(card);
+    lv_label_set_text(nl, TR("Night mode (invert)"));
+    lv_obj_set_style_text_color(nl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_set_style_text_font(nl, &g_font_14, LV_PART_MAIN);
+    lv_obj_set_pos(nl, 2, y + 4);
+    lv_obj_t* sw_night = lv_switch_create(card);
+    lv_obj_align(sw_night, LV_ALIGN_TOP_RIGHT, 0, y);
+    if (s_map_night) lv_obj_add_state(sw_night, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw_night, mapOptNightCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += 40;
+  }
+
+  // ---- Section separator + label: the on-map visibility toggles below are a
+  //      distinct, lower-stakes group from the tile settings above.
+  {
+    lv_obj_t* sep = lv_obj_create(card);
+    lv_obj_remove_style_all(sep);
+    lv_obj_set_size(sep, cardw - 24, 1);
+    lv_obj_set_pos(sep, 0, y + 4);
+    lv_obj_set_style_bg_color(sep, lv_color_hex(0x303438), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_t* sl = lv_label_create(card);
+    lv_label_set_text(sl, TR("Show on map"));
+    lv_obj_set_style_text_color(sl, lv_color_hex(0x8A929B), LV_PART_MAIN);
+    lv_obj_set_style_text_font(sl, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_pos(sl, 2, y + 10);
+    y += 34;
+  }
+
+  // Rows: per-element on-map visibility (link lines / coords / tile z-x-y / contacts).
+  {
+    struct { const char* label; bool state; lv_event_cb_t cb; } rows[] = {
+      { "Show link lines",  s_map_show_links,    mapOptLinesCb    },
+      { "Show coordinates", s_map_show_coords,   mapOptCoordsCb   },
+      { "Show tile z/x/y",  s_map_show_tilexyz,  mapOptTileXYZCb  },
+      { "Show contacts",    s_map_show_contacts, mapOptContactsCb },
+    };
+    for (auto& r : rows) {
+      lv_obj_t* l = lv_label_create(card);
+      lv_label_set_text(l, TR(r.label));
+      lv_obj_set_style_text_color(l, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+      lv_obj_set_style_text_font(l, &g_font_14, LV_PART_MAIN);
+      lv_obj_set_pos(l, 2, y + 4);
+      lv_obj_t* sw = lv_switch_create(card);
+      lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+      if (r.state) lv_obj_add_state(sw, LV_STATE_CHECKED);
+      lv_obj_add_event_cb(sw, r.cb, LV_EVENT_VALUE_CHANGED, nullptr);
+      y += 40;
+    }
+  }
 
   auto mk_row_btn = [&](const char* txt, lv_event_cb_t cb) {
     lv_obj_t* b = lv_btn_create(card);
@@ -16353,7 +16450,14 @@ static void openMapOptions() {
   // above the title/switch/rows and reliably tappable. Same dismiss path as the
   // backdrop tap. The 32×32 hit area only grazes the link-lines switch (y=30)
   // by ~2px, which is imperceptible.
-  addCloseXBadge(card, mapOptionsDismissCb);
+  // This card scrolls (many rows), and the close badge floats fixed at the
+  // top-right. Give it an opaque chip + a faint ring so toggles scrolling under
+  // it are cleanly hidden instead of bleeding through the bare glyph.
+  lv_obj_t* xb = addCloseXBadge(card, mapOptionsDismissCb);
+  lv_obj_set_style_bg_color(xb, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(xb, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(xb, lv_color_hex(0x303438), LV_PART_MAIN);
+  lv_obj_set_style_border_width(xb, 1, LV_PART_MAIN);
 }
 
 static void mapOpenOptionsCb(lv_event_t* e) {
@@ -16979,6 +17083,45 @@ static void mapRecenterCb(lv_event_t* e) {
   refreshMapInfoLabel();
 }
 
+// Auto-follow: while enabled, recenter the map on self whenever the GPS position
+// moves meaningfully (or the view was panned away). Called from the map tick.
+static void mapAutoFollowTick() {
+  if (!s_map_follow || !g_lv.task) return;
+  const double lat = g_lv.task->getNodeLat();
+  const double lon = g_lv.task->getNodeLon();
+  if (lat == 0.0 && lon == 0.0) return;                 // no fix yet
+  if (fabs(lat - s_map_center_lat) < 5e-5 &&
+      fabs(lon - s_map_center_lon) < 5e-5) return;      // ~5 m: ignore GPS jitter
+  s_map_center_lat = lat;
+  s_map_center_lon = lon;
+  renderMapTiles();
+  renderMapMarkers();
+  refreshMapInfoLabel();
+}
+
+// Auto-follow toggle button (bottom of the right-edge column). Highlights when on
+// and recenters immediately so the map jumps to your position the moment you enable it.
+static void mapFollowToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  s_map_follow = !s_map_follow;
+  if (s_map_follow_btn) {
+    if (s_map_follow) lv_obj_add_state(s_map_follow_btn, LV_STATE_CHECKED);
+    else              lv_obj_clear_state(s_map_follow_btn, LV_STATE_CHECKED);
+  }
+  if (g_lv.task) g_lv.task->showAlert(s_map_follow ? TR("Auto-refresh on") : TR("Auto-refresh off"), 900);
+  if (s_map_follow && g_lv.task) {
+    const double lat = g_lv.task->getNodeLat();
+    const double lon = g_lv.task->getNodeLon();
+    if (lat != 0.0 || lon != 0.0) {
+      s_map_center_lat = lat;
+      s_map_center_lon = lon;
+      renderMapTiles();
+      renderMapMarkers();
+      refreshMapInfoLabel();
+    }
+  }
+}
+
 // Recenters on self GPS and rebuilds the tile grid. Called from tabChangedCb
 // every time the user switches TO the Map tab.
 static void onMapTabActivated() {
@@ -17169,6 +17312,7 @@ static void makeMapTab(lv_obj_t* tab) {
   style_corner(s_map_zoom_lbl);
   lv_label_set_text(s_map_zoom_lbl, TR(""));
   lv_obj_align(s_map_zoom_lbl, LV_ALIGN_TOP_LEFT, 2, STATUSBAR_H + 2);
+  applyMapTextVis();   // honour the coords / tile-line visibility toggles
   (void)kMapInfoH;
 
   // Touch catcher: the tiles live on the background canvas (behind the tabview)
@@ -17211,9 +17355,15 @@ static void makeMapTab(lv_obj_t* tab) {
   // Options gear sits at the TOP of the right-edge column; zoom/recenter below,
   // then a "contacts on map" picker (list of GPS-bearing contacts → recenter).
   make_overlay_btn(LV_SYMBOL_SETTINGS, 4,         mapOpenOptionsCb);
-  make_overlay_btn(TOUCH_SYM_ZOOM,     4 + 32,    mapZoomToggleCb);   // magnifier — toggles the zoom slider (was +/-)
+  make_overlay_btn("+/-",              4 + 32,    mapZoomToggleCb);   // +/- — toggles the zoom slider
   make_overlay_btn(LV_SYMBOL_GPS,      4 + 32*2,  mapRecenterCb);
   make_overlay_btn(LV_SYMBOL_LIST,     4 + 32*3,  mapOpenContactsCb);
+  // Auto-follow toggle: recenters on self whenever the GPS coords change. Lit
+  // (accent) while active via the CHECKED state.
+  s_map_follow_btn = make_overlay_btn(LV_SYMBOL_REFRESH, 4 + 32*4, mapFollowToggleCb);
+  lv_obj_set_style_bg_color(s_map_follow_btn, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN | LV_STATE_CHECKED);
+  lv_obj_set_style_bg_opa(s_map_follow_btn, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_CHECKED);
+  if (s_map_follow) lv_obj_add_state(s_map_follow_btn, LV_STATE_CHECKED);
 
   // Zoom slider — a full-width overlay along the bottom of the map, hidden until
   // the zoom button is tapped. Reuses the control-centre brightness-slider look.
@@ -17937,6 +18087,11 @@ static char      s_msg_menu_sender[UITask::MAX_SENDER_NAME + 1] = {0};
 // Buffer the body text so the Copy button doesn't reach back into the ring
 // (the bubble might get redrawn between menu-open and copy-tap).
 static char      s_msg_menu_text[UITask::MAX_MSG_TEXT + 1] = {0};
+// Pre-composed one-tap "ack" line (mention + link quality + route of the message),
+// built when the menu opens so the Ack button never reaches back into the (possibly
+// rotated) ring. s_msg_menu_channel picks which composer to drop it into.
+static char      s_msg_menu_ack[UITask::MAX_MSG_TEXT + 1] = {0};
+static bool      s_msg_menu_channel = false;
 
 static void closeMsgActionMenu() {
   if (s_msg_menu_root) {
@@ -18051,6 +18206,7 @@ static void msgMenuMentionCb(lv_event_t* e) {
   if (!p.composer_ta || !s_msg_menu_sender[0]) return;
   char ins[UITask::MAX_SENDER_NAME + 8];
   snprintf(ins, sizeof ins, "@[%s] ", s_msg_menu_sender);
+  taClearSelection(p.composer_ta);
   lv_textarea_add_text(p.composer_ta, ins);
   lv_textarea_set_cursor_pos(p.composer_ta, LV_TEXTAREA_CURSOR_LAST);
   showKb(&p);                               // focus composer so typing continues there
@@ -18076,6 +18232,57 @@ static void msgMenuBlockCb(lv_event_t* e) {
   g_lv.task->showAlert(ok ? TR("Sender blocked") : TR("Block list full"), 1500);
 }
 
+// Compose a one-tap "ack" for an incoming message: @mentions the sender (on a
+// channel) and reports the link quality + route of THAT message, so you can
+// confirm to them their (test) message arrived and how strong it came in. Built
+// once when the menu opens; dropped into the composer for review, never auto-sent.
+static void buildAckText(UITask::UIMessage& m, char* out, size_t cap) {
+  if (!out || cap == 0) return;
+  out[0] = '\0';
+  int n = 0;
+  if (m.channel && m.sender[0])
+    n += snprintf(out + n, cap - (size_t)n, "@[%s], ack", m.sender);
+  else
+    n += snprintf(out + n, cap - (size_t)n, "Ack");
+  if (m.meta_flags & UITask::MSG_META_HAS_RX) {
+    n += snprintf(out + n, cap - (size_t)n, ": SNR %.1f dB, RSSI %d dBm",
+                  (double)m.snr_q4 / 4.0, (int)m.rssi);
+    if (m.meta_flags & UITask::MSG_META_IS_FLOOD) {
+      const uint8_t hops = (uint8_t)(m.path_len & 0x3F);
+      n += snprintf(out + n, cap - (size_t)n, ", %u hop%s", (unsigned)hops, hops == 1 ? "" : "s");
+      // Append the hop codes in hex ("via 3A, F1, …") — the raw path-hash bytes
+      // each repeater is keyed by, matching what the mesh shows on the wire.
+      const uint8_t hsz = (uint8_t)((m.path_len >> 6) + 1);
+      int off = 0, listed = 0;
+      for (uint8_t h = 0; h < hops && off + (int)hsz <= m.in_path_n && listed < 8; ++h, off += hsz) {
+        if (n >= (int)cap - 24) break;       // leave room; never overflow out[]
+        n += snprintf(out + n, cap - (size_t)n, "%s", listed == 0 ? " via " : ", ");
+        for (uint8_t b = 0; b < hsz && b < 4 && n < (int)cap - 3; ++b)
+          n += snprintf(out + n, cap - (size_t)n, "%02X", m.in_path[off + b]);
+        ++listed;
+      }
+    } else {
+      n += snprintf(out + n, cap - (size_t)n, ", direct");
+    }
+  }
+  if (n < 0 || n >= (int)cap) out[cap - 1] = '\0';
+}
+
+// "Ack" button: drop the pre-composed ack line into the active chat's composer
+// (channel or DM) at the cursor, for the operator to review and send.
+static void msgMenuAckCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  lv_indev_t* a = lv_indev_get_act();
+  if (a) lv_indev_wait_release(a);
+  closeMsgActionMenu();
+  LvChatPanel& p = s_msg_menu_channel ? g_lv.ch : g_lv.dm;
+  if (!p.composer_ta || !s_msg_menu_ack[0]) return;
+  taClearSelection(p.composer_ta);                 // never replace a stray selection
+  lv_textarea_add_text(p.composer_ta, s_msg_menu_ack);
+  lv_textarea_set_cursor_pos(p.composer_ta, LV_TEXTAREA_CURSOR_LAST);
+  showKb(&p);                                      // focus composer so you can tweak/send
+}
+
 static void openMessageActionMenu(int msg_idx) {
   if (!g_lv.task) return;
   UITask::UIMessage m;
@@ -18088,7 +18295,12 @@ static void openMessageActionMenu(int msg_idx) {
   s_msg_menu_text[sizeof(s_msg_menu_text) - 1] = '\0';
   strncpy(s_msg_menu_sender, m.sender, sizeof(s_msg_menu_sender) - 1);
   s_msg_menu_sender[sizeof(s_msg_menu_sender) - 1] = '\0';
-  // Offer "Mention" only for an incoming channel message (mention its sender).
+  // Pre-compose the ack line now (RX metadata is on `m` here; the ring may rotate
+  // before the button is tapped). s_msg_menu_channel picks the composer to fill.
+  s_msg_menu_channel = m.channel;
+  buildAckText(m, s_msg_menu_ack, sizeof s_msg_menu_ack);
+  // "Ack" (quick link-quality confirmation) + "Mention" are for incoming messages.
+  const bool can_ack     = !m.outgoing && m.sender[0];   // ack its sender (channel or DM)
   const bool can_mention = m.channel && !m.outgoing && m.sender[0];
   const bool can_block   = !m.outgoing;   // block the sender — never for our own messages
 
@@ -18106,14 +18318,19 @@ static void openMessageActionMenu(int msg_idx) {
   lv_obj_add_event_cb(s_msg_menu_root, msgMenuBackdropCb, LV_EVENT_CLICKED, nullptr);
 
   const int card_w = 180;
-  const int btn_h  = 38;
-  const int gap    = 6;
+  const int btn_h  = 30;   // was 38 — the menu now carries up to 5 rows (Ack/Mention/Copy/Info/Block); shrink so they fit a 240-px screen
+  const int gap    = 4;
   const int pad    = 10;
-  // 28-px header row at the top reserves space for the close-X badge so it
-  // doesn't sit on top of the Copy / Info buttons.
-  const int hdr_h  = 28;
-  const int nbtn   = (can_mention ? 1 : 0) + 2 /*Copy+Info*/ + (can_block ? 1 : 0);
-  const int card_h = hdr_h + nbtn * btn_h + (nbtn - 1) * gap + 2 * pad;
+  // Header row reserves space for the close-X badge so it doesn't sit on a button.
+  const int hdr_h  = 24;
+  const int nbtn   = (can_ack ? 1 : 0) + (can_mention ? 1 : 0) + 2 /*Copy+Info*/ + (can_block ? 1 : 0);
+  int card_h = hdr_h + nbtn * btn_h + (nbtn - 1) * gap + 2 * pad;
+  // Never exceed the visible area under the status bar; scroll if it ever would
+  // (e.g. an even taller menu, or a shorter display). The close-X floats, so it
+  // stays pinned while the buttons scroll.
+  const int avail_h = (int)(sh - STATUSBAR_H) - 8;
+  const bool scroll_menu = (card_h > avail_h);
+  if (scroll_menu) card_h = avail_h;
 
   lv_obj_t* card = lv_obj_create(s_msg_menu_root);
   lv_obj_remove_style_all(card);
@@ -18125,7 +18342,12 @@ static void openMessageActionMenu(int msg_idx) {
   lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
   lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
   lv_obj_set_style_pad_all(card, pad, LV_PART_MAIN);
-  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  if (scroll_menu) {
+    lv_obj_set_scroll_dir(card, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_AUTO);
+  } else {
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  }
   addCloseXBadge(card, msgMenuBackdropCb);
 
   auto mk_btn = [&](const char* text, lv_event_cb_t cb, int y_off) {
@@ -18141,6 +18363,10 @@ static void openMessageActionMenu(int msg_idx) {
     lv_obj_center(lbl);
   };
   int by = hdr_h;
+  if (can_ack) {
+    mk_btn(LV_SYMBOL_OK "  Ack", msgMenuAckCb, by);
+    by += btn_h + gap;
+  }
   if (can_mention) {
     char ml[UITask::MAX_SENDER_NAME + 16];
     snprintf(ml, sizeof ml, "@%.16s", m.sender);   // "Mention" is implied by the @
@@ -19361,7 +19587,7 @@ static void pushDiagLine(const char* message) {
 }
 
 static void pushLogLine(char ring[][RXLOG_COLS], int& line_counter, const char* message) {
-  if (!message || !message[0]) return;
+  if (!ring || !message || !message[0]) return;
   strncpy(ring[line_counter % RXLOG_LINES], message, RXLOG_COLS - 1);
   ring[line_counter % RXLOG_LINES][RXLOG_COLS - 1] = '\0';
   ++line_counter;
@@ -19370,7 +19596,7 @@ static void pushLogLine(char ring[][RXLOG_COLS], int& line_counter, const char* 
 static void collectLogText(const char ring[][RXLOG_COLS], int line_counter, char* out, size_t out_cap) {
   if (!out || out_cap == 0) return;
   out[0] = '\0';
-  if (line_counter <= 0) return;
+  if (!ring || line_counter <= 0) return;
   int p = 0;
   int first = (line_counter > RXLOG_LINES) ? (line_counter - RXLOG_LINES) : 0;
   for (int i = first; i < line_counter && p < static_cast<int>(out_cap) - 2; ++i) {
@@ -19402,11 +19628,15 @@ static void setLogModeButtonStyles() {
 
 static void refreshLogModalView() {
   if (!g_set_modal.log_view_ta || g_set_modal.kind != SettingsModalKind::Log) return;
-  static char text[(RXLOG_LINES * RXLOG_COLS) + 64];
+  static const size_t kLogTextSz = (RXLOG_LINES * RXLOG_COLS) + 64;
+  static char* text = nullptr;   // log-view scratch — lazy PSRAM (internal fallback): ~2.3 KB off internal DRAM
+  if (!text) { text = (char*)heap_caps_malloc(kLogTextSz, MALLOC_CAP_SPIRAM);
+               if (!text) text = (char*)heap_caps_malloc(kLogTextSz, MALLOC_CAP_8BIT); }
+  if (!text) return;
   if (g_set_modal.log_mode == 0) {
-    collectLogText(s_rxlog_ring, s_rxlog_line, text, sizeof(text));
+    collectLogText(s_rxlog_ring, s_rxlog_line, text, kLogTextSz);
   } else {
-    collectLogText(s_rawlog_ring, s_rawlog_line, text, sizeof(text));
+    collectLogText(s_rawlog_ring, s_rawlog_line, text, kLogTextSz);
   }
   lv_textarea_set_text(g_set_modal.log_view_ta, text[0] ? text : "No entries yet.");
   lv_textarea_set_cursor_pos(g_set_modal.log_view_ta, LV_TEXTAREA_CURSOR_LAST);
@@ -21709,7 +21939,10 @@ static void openMentionsScreen() {
 
   // Scan all channel messages that @mention me, newest first.
   struct M { uint32_t ts; int idx; };
-  static M found[UITask::MAX_UI_MESSAGES];
+  static M* found = nullptr;   // mentions scratch — lazy PSRAM (internal fallback): ~4 KB off internal DRAM
+  if (!found) { found = (M*)heap_caps_malloc(sizeof(M) * UITask::MAX_UI_MESSAGES, MALLOC_CAP_SPIRAM);
+                if (!found) found = (M*)heap_caps_malloc(sizeof(M) * UITask::MAX_UI_MESSAGES, MALLOC_CAP_8BIT); }
+  if (!found) return;
   int nf = 0;
   for (int i = 0; i < UITask::MAX_UI_MESSAGES; i++) {
     UITask::UIMessage m;
@@ -22593,7 +22826,7 @@ static void refreshStatusLabels() {
   // Map tab: refresh the bottom info strip (self GPS + on-map count) only
   // when the tab is actually visible. Cheap, but no point doing it on every
   // tick if the user is somewhere else.
-  if (active_tab == MAP_TAB_INDEX) refreshMapInfoLabel();
+  if (active_tab == MAP_TAB_INDEX) { mapAutoFollowTick(); refreshMapInfoLabel(); }
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
   // Wi-Fi fetcher arrived a new tile — re-render the map so the freshly
   // downloaded tile appears. Only re-render if we're actually on the
@@ -25930,8 +26163,18 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
   }
   s_tiles_from_sd = touchPrefsGetTilesFromSd();   // map tile source: server (default) vs microSD
   s_map_night = touchPrefsGetMapNight();          // map night mode (render-time tile invert)
+  s_map_show_coords   = touchPrefsGetMapShowCoords();     // per-element map text/marker visibility
+  s_map_show_tilexyz  = touchPrefsGetMapShowTileXYZ();
+  s_map_show_contacts = touchPrefsGetMapShowContacts();
   { const uint8_t pz = touchPrefsGetMapZoom();    // restore the last user-set map zoom
     if (pz >= k_map_zoom_min && pz <= k_map_zoom_max) s_map_zoom = pz; }
+  // Monitor RX/RAW log rings live in PSRAM (2×28×80 = 4.4 KB) so they don't sit
+  // in scarce internal DRAM that Wi-Fi DMA needs. Zero-init; the push/collect
+  // helpers null-guard, so a (vanishingly unlikely) OOM just drops Monitor logs.
+  if (!s_rxlog_ring)  s_rxlog_ring  = (char(*)[RXLOG_COLS])heap_caps_calloc(RXLOG_LINES, RXLOG_COLS, MALLOC_CAP_SPIRAM);
+  if (!s_rxlog_ring)  s_rxlog_ring  = (char(*)[RXLOG_COLS])heap_caps_calloc(RXLOG_LINES, RXLOG_COLS, MALLOC_CAP_8BIT);
+  if (!s_rawlog_ring) s_rawlog_ring = (char(*)[RXLOG_COLS])heap_caps_calloc(RXLOG_LINES, RXLOG_COLS, MALLOC_CAP_SPIRAM);
+  if (!s_rawlog_ring) s_rawlog_ring = (char(*)[RXLOG_COLS])heap_caps_calloc(RXLOG_LINES, RXLOG_COLS, MALLOC_CAP_8BIT);
 #if defined(ESP32)
   // Bump the CPU above the 80 MHz base-config default. The base was
   // chosen for power on a headless companion build; on a touch device

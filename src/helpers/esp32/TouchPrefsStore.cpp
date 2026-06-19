@@ -35,7 +35,7 @@ static bool s_begun = false;
 // short read (→ treat as absent → defaults); `ver` lets later builds add fields.
 static const char* KEY_CFG = "cfg";
 static const uint16_t TOUCH_CFG_MAGIC = 0x5743;   // 'WC' (WadaCfg)
-static const uint8_t  TOUCH_CFG_VER   = 5;   // v2 sig_probe/poll; v3 tz_zone; v4 hide_node_name; v5 map_night/map_zoom
+static const uint8_t  TOUCH_CFG_VER   = 6;   // v2 sig_probe/poll; v3 tz_zone; v4 hide_node_name; v5 map_night/map_zoom; v6 map text/marker visibility
 
 // Defaults (kept identical to the historical per-key defaults).
 static const uint16_t DEFAULT_SCREEN_TIMEOUT_S = 20;
@@ -76,6 +76,9 @@ struct __attribute__((packed)) TouchCfg {
   uint8_t  hide_node_name;   // hide the device name in the status bar + park clock left (bool) — v4
   uint8_t  map_night;        // invert map tile colours at render time (bool) — v5
   uint8_t  map_zoom;         // last map zoom level (0 = unset, auto-snap) — v5
+  uint8_t  map_show_coords;  // show the coords read-out on the map (bool) — v6
+  uint8_t  map_show_tilexyz; // show the zoom + tile z/x/y line on the map (bool) — v6
+  uint8_t  map_show_contacts;// show contact markers on the map (bool) — v6
 };
 
 static TouchCfg s_cfg;
@@ -128,6 +131,9 @@ static void cfgSetDefaults(TouchCfg& c) {
   c.hide_node_name = 0;         // default: show the device name
   c.map_night     = 0;          // default: normal (light) tiles
   c.map_zoom      = 0;          // 0 = unset -> auto-snap on first map open
+  c.map_show_coords   = 1;      // default: show coords / tile line / contacts
+  c.map_show_tilexyz  = 1;
+  c.map_show_contacts = 1;
 }
 
 // Persist the whole blob using the same end()/begin(RW)/put/end()/begin(RO)
@@ -715,6 +721,34 @@ uint8_t touchPrefsGetMapZoom() {
 bool touchPrefsSetMapZoom(uint8_t z) {
   if (!s_begun) touchPrefsBegin();
   s_cfg.map_zoom = z;
+  return cfgFlush();
+}
+
+bool touchPrefsGetMapShowCoords() {
+  if (!s_begun) touchPrefsBegin();
+  return s_cfg.map_show_coords != 0;
+}
+bool touchPrefsSetMapShowCoords(bool on) {
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.map_show_coords = on ? 1 : 0;
+  return cfgFlush();
+}
+bool touchPrefsGetMapShowTileXYZ() {
+  if (!s_begun) touchPrefsBegin();
+  return s_cfg.map_show_tilexyz != 0;
+}
+bool touchPrefsSetMapShowTileXYZ(bool on) {
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.map_show_tilexyz = on ? 1 : 0;
+  return cfgFlush();
+}
+bool touchPrefsGetMapShowContacts() {
+  if (!s_begun) touchPrefsBegin();
+  return s_cfg.map_show_contacts != 0;
+}
+bool touchPrefsSetMapShowContacts(bool on) {
+  if (!s_begun) touchPrefsBegin();
+  s_cfg.map_show_contacts = on ? 1 : 0;
   return cfgFlush();
 }
 

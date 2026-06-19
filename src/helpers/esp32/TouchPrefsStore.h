@@ -90,6 +90,15 @@ bool touchPrefsSetMapNight(bool on);
 uint8_t touchPrefsGetMapZoom();
 bool    touchPrefsSetMapZoom(uint8_t z);
 
+/** Per-element visibility of the map's on-screen text/markers. All default true
+ *  (shown), so existing installs are unchanged. */
+bool touchPrefsGetMapShowCoords();
+bool touchPrefsSetMapShowCoords(bool on);
+bool touchPrefsGetMapShowTileXYZ();
+bool touchPrefsSetMapShowTileXYZ(bool on);
+bool touchPrefsGetMapShowContacts();
+bool touchPrefsSetMapShowContacts(bool on);
+
 /** Hide the device/profile name in the status bar and move the clock to the
  *  left where the name used to be. Default false (name shown). */
 bool touchPrefsGetHideNodeName();
