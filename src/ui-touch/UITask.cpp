@@ -2983,10 +2983,39 @@ static void kbSetRotateArrowsOpa(lv_opa_t opa) {
 // hardware SPACE to switch keyboard languages, so the on-screen keyboard carries
 // a little key showing the active layout's 2-letter code; tapping it cycles
 // English -> each enabled secondary layout -> back, like the T-Deck's SPACE.
+static void kbLangBtnRefresh();
 static const char* kbLayoutCode(KeyboardLayoutId id) {
-  static const char* k_codes[] = { "EN", "BG", "RU", "UK", "SR", "EL", "AR" };
+  static const char* k_codes[] = { "EN", "BG", "RU", "UK", "SR", "EL", "AR", "FR" };
   const uint8_t i = static_cast<uint8_t>(id);
   return (i < (sizeof k_codes / sizeof k_codes[0])) ? k_codes[i] : "EN";
+}
+static KeyboardLayoutId kbDefaultLayoutForUiLang(uint8_t lang) {
+  switch (lang) {
+    case LANG_BG: return KeyboardLayoutId::BG;
+    case LANG_RU: return KeyboardLayoutId::RU;
+    case LANG_UK: return KeyboardLayoutId::UK;
+    case LANG_SR: return KeyboardLayoutId::SR;
+    case LANG_EL: return KeyboardLayoutId::EL;
+    case LANG_FR: return KeyboardLayoutId::FR;
+    default:      return KeyboardLayoutId::EN;
+  }
+}
+static void kbApplyUiLangDefault(uint8_t lang) {
+  KeyboardLayoutId target = kbDefaultLayoutForUiLang(lang);
+  uint32_t mask = keyboardLayoutsGetEnabledMask();
+  const uint8_t target_id = static_cast<uint8_t>(target);
+  if (target != KeyboardLayoutId::EN && !(mask & (1u << target_id))) {
+    mask |= (1u << target_id);
+    keyboardLayoutsSetEnabledMask(mask);
+#if defined(ESP32)
+    touchPrefsSetEnabledLayouts(static_cast<uint16_t>(mask));
+#endif
+  }
+  if (g_lv.keyboard) keyboardLayoutsApply(g_lv.keyboard, target);
+#if defined(ESP32)
+  touchPrefsSetKeyboardLayout(target_id);
+#endif
+  kbLangBtnRefresh();
 }
 static void kbLangBtnRefresh() {
   if (s_kb_lang_lbl) lv_label_set_text(s_kb_lang_lbl, kbLayoutCode(keyboardLayoutsGetCurrent()));
@@ -19176,6 +19205,7 @@ static void langChosenCb(lv_event_t* e) {
   touchPrefsSetUiLang(lang);
 #endif
   i18nSetLang(lang);
+  kbApplyUiLangDefault(lang);
   if (g_lv.task) g_lv.task->rebootDevice();
 }
 
