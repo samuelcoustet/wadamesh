@@ -807,6 +807,7 @@ struct LvUiState {
   lv_obj_t* home_state;
   lv_obj_t* home_unread;   // clickable "envelope + Unread N" line -> Chats inbox
   lv_obj_t* home_stats;
+  lv_obj_t* home_env;
   // Duty-cycle meter (label + bar) on the Home tab. Surfaces the live TX
   // budget remaining so the operator notices regulatory throttling before
   // a ten-message-burst stalls. Created in makeHome iff the user pref is on.
@@ -14183,6 +14184,7 @@ static void makeHome(lv_obj_t* tab) {
 #if defined(HAS_TANMATSU)
   s_home_info       = nullptr;
 #endif
+  g_lv.home_env     = nullptr;
 
   g_lv.home_state = lv_label_create(tab);
   lv_label_set_text(g_lv.home_state, TR("Connecting..."));
@@ -14219,6 +14221,14 @@ static void makeHome(lv_obj_t* tab) {
   g_lv.home_dc_label = nullptr;
   g_lv.home_dc_bar   = nullptr;
 
+  g_lv.home_env = lv_label_create(tab);
+  lv_label_set_text(g_lv.home_env, TR(""));
+  lv_obj_set_style_text_color(g_lv.home_env, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_style_text_font(g_lv.home_env, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_width(g_lv.home_env, home_land ? (cw - RSTRIP) : cw);
+  lv_label_set_long_mode(g_lv.home_env, LV_LABEL_LONG_WRAP);
+  lv_obj_align(g_lv.home_env, LV_ALIGN_TOP_LEFT, 0, SC(58));
+
   // TX / RX rolling chart. 60 samples, two series (TX green, RX blue).
   // Compact legend strip above the chart shows live totals — updated on every
   // refreshStatusLabels tick. With home_state now at y=36 and home_stats
@@ -14228,7 +14238,7 @@ static void makeHome(lv_obj_t* tab) {
   // home_state at y=4, home_stats (two-line WRAP) at y=22 reaches roughly
   // y=50; chart group starts at y=60 with breathing room. Used to be y=94
   // when the title/clock/battery row lived inside the tab.
-  const int chart_y = SC(60);
+  const int chart_y = SC(98);
   s_home_chart_legend = lv_label_create(tab);
   lv_label_set_text(s_home_chart_legend, TR("TX 0  /  RX 0"));
   lv_obj_set_style_text_color(s_home_chart_legend, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
@@ -24394,6 +24404,11 @@ static void refreshStatusLabels() {
 #else
     setLabelIfChanged(g_lv.home_stats, TR(""));
 #endif
+  }
+  if (g_lv.home_env && home_active) {
+    char env[192];
+    if (g_lv.task->getLocalEnvSummary(env, sizeof env)) setLabelIfChanged(g_lv.home_env, env);
+    else setLabelIfChanged(g_lv.home_env, TR(""));
   }
   // Unread line (its own tappable row): mail icon + translated count.
   if (g_lv.home_unread && home_active) {
