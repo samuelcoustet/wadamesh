@@ -19,6 +19,7 @@ enum class KeyboardLayoutId : uint8_t {
     SR = 4,   // Serbian (phonetic) — best-effort, validate with a native speaker
     EL = 5,   // Greek (ΕΛΟΤ-style phonetic)
     AR = 6,   // Arabic (RTL, Arabic-101 positions) — EXPERIMENTAL, needs on-device validation
+    FR = 7,   // French (AZERTY)
     Count
 };
 

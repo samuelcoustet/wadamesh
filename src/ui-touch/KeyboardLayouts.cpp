@@ -221,6 +221,37 @@ static const lv_btnmatrix_ctrl_t kb_en_upper_ctrl[] = {
     LV_KEYBOARD_CTRL_BTN_FLAGS | 2, LV_BTNMATRIX_CTRL_CHECKED | 2, 6, LV_BTNMATRIX_CTRL_CHECKED | 2, LV_KEYBOARD_CTRL_BTN_FLAGS | 2
 };
 
+/* ---------- French (AZERTY) on-screen keyboard ---------- */
+/* Keeps the proven LVGL control rows/punctuation, but swaps the alpha rows to
+ * a familiar French AZERTY order. Accents still come from the existing popup. */
+static const char* kb_fr_lower[] = {
+    "1#", "a", "z", "e", "r", "t", "y", "u", "i", "o", "p", LV_SYMBOL_BACKSPACE, "\n",
+    "ABC", "q", "s", "d", "f", "g", "h", "j", "k", "l", "m", LV_SYMBOL_NEW_LINE, "\n",
+    "_", "-", "w", "x", "c", "v", "b", "n", ".", ",", ":", "", "\n",
+    LV_SYMBOL_KEYBOARD, LV_SYMBOL_LEFT, " ", LV_SYMBOL_RIGHT, LV_SYMBOL_OK, ""
+};
+
+static const lv_btnmatrix_ctrl_t kb_fr_lower_ctrl[] = {
+    LV_KEYBOARD_CTRL_BTN_FLAGS | 5, EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), LV_BTNMATRIX_CTRL_CHECKED | 7,
+    LV_KEYBOARD_CTRL_BTN_FLAGS | 6, EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), LV_BTNMATRIX_CTRL_CHECKED | 7,
+    LV_BTNMATRIX_CTRL_CHECKED | EN_KB_BTN(1), LV_BTNMATRIX_CTRL_CHECKED | EN_KB_BTN(1), EN_KB_BTN(1), EN_KB_BTN(1), EN_KB_BTN(1), EN_KB_BTN(1), EN_KB_BTN(1), EN_KB_BTN(1), LV_BTNMATRIX_CTRL_CHECKED | EN_KB_BTN(1), LV_BTNMATRIX_CTRL_CHECKED | EN_KB_BTN(1), LV_BTNMATRIX_CTRL_CHECKED | EN_KB_BTN(1), LV_BTNMATRIX_CTRL_HIDDEN,
+    LV_KEYBOARD_CTRL_BTN_FLAGS | 2, LV_BTNMATRIX_CTRL_CHECKED | 2, 6, LV_BTNMATRIX_CTRL_CHECKED | 2, LV_KEYBOARD_CTRL_BTN_FLAGS | 2
+};
+
+static const char* kb_fr_upper[] = {
+    "1#", "A", "Z", "E", "R", "T", "Y", "U", "I", "O", "P", LV_SYMBOL_BACKSPACE, "\n",
+    "abc", "Q", "S", "D", "F", "G", "H", "J", "K", "L", "M", LV_SYMBOL_NEW_LINE, "\n",
+    "_", "-", "W", "X", "C", "V", "B", "N", ".", ",", ":", "", "\n",
+    LV_SYMBOL_KEYBOARD, LV_SYMBOL_LEFT, " ", LV_SYMBOL_RIGHT, LV_SYMBOL_OK, ""
+};
+
+static const lv_btnmatrix_ctrl_t kb_fr_upper_ctrl[] = {
+    LV_KEYBOARD_CTRL_BTN_FLAGS | 5, EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), EN_KB_BTN(4), LV_BTNMATRIX_CTRL_CHECKED | 7,
+    LV_KEYBOARD_CTRL_BTN_FLAGS | 6, EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), EN_KB_BTN(3), LV_BTNMATRIX_CTRL_CHECKED | 7,
+    LV_BTNMATRIX_CTRL_CHECKED | EN_KB_BTN(1), LV_BTNMATRIX_CTRL_CHECKED | EN_KB_BTN(1), EN_KB_BTN(1), EN_KB_BTN(1), EN_KB_BTN(1), EN_KB_BTN(1), EN_KB_BTN(1), EN_KB_BTN(1), LV_BTNMATRIX_CTRL_CHECKED | EN_KB_BTN(1), LV_BTNMATRIX_CTRL_CHECKED | EN_KB_BTN(1), LV_BTNMATRIX_CTRL_CHECKED | EN_KB_BTN(1), LV_BTNMATRIX_CTRL_HIDDEN,
+    LV_KEYBOARD_CTRL_BTN_FLAGS | 2, LV_BTNMATRIX_CTRL_CHECKED | 2, 6, LV_BTNMATRIX_CTRL_CHECKED | 2, LV_KEYBOARD_CTRL_BTN_FLAGS | 2
+};
+
 struct OsKeyboardLayout {
     KeyboardLayoutId id;
     const char*      name;
@@ -252,6 +283,9 @@ static const OsKeyboardLayout k_os_layouts[] = {
     { KeyboardLayoutId::AR, "AR",
       kb_ar_lower, kb_ar_lower_ctrl,
       kb_ar_lower, kb_ar_lower_ctrl },   // unicameral: same map for both
+    { KeyboardLayoutId::FR, "FR",
+      kb_fr_lower, kb_fr_lower_ctrl,
+      kb_fr_upper, kb_fr_upper_ctrl },
 };
 
 /* ================================================================
@@ -271,6 +305,7 @@ static const HwKeyboardLayout k_hw_layouts[] = {
     { KeyboardLayoutId::SR, "SR" },
     { KeyboardLayoutId::EL, "EL" },
     { KeyboardLayoutId::AR, "AR" },
+    { KeyboardLayoutId::FR, "FR" },
 };
 
 /* Bulgarian phonetic mapping for T-Deck.
@@ -424,6 +459,24 @@ static const char* hw_ar_digits[10] = {
     nullptr, "ج", "د", "ذ", "ز", "ط", "ظ", "و", nullptr, nullptr
 };
 
+/* French AZERTY mapping for the T-Deck's US-QWERTY physical keyboard.
+ * We only remap the alpha keys so punctuation/digits remain predictable on the
+ * compact hardware; accented letters are still available through accent popups. */
+static const char* hw_fr_lower[26] = {
+    "q", "b", "c", "d", "e", "f", "g", "h", "i", "j",
+    "k", "l", "m", "n", "o", "p", "a", "r", "s", "t",
+    "u", "v", "z", "x", "y", "w"
+};
+
+static const char* hw_fr_upper[26] = {
+    "Q", "B", "C", "D", "E", "F", "G", "H", "I", "J",
+    "K", "L", "M", "N", "O", "P", "A", "R", "S", "T",
+    "U", "V", "Z", "X", "Y", "W"
+};
+
+static const char* hw_fr_digits[10]       = { nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr };
+static const char* hw_fr_digits_shift[10] = { nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr };
+
 /* ================================================================
  * Runtime state
  * ================================================================ */
@@ -499,6 +552,7 @@ static const HwPhoneticMap k_hw_maps[KEYBOARD_LAYOUT_COUNT] = {
     /* SR */ { hw_sr_lower,  hw_sr_upper,  hw_sr_digits,   hw_sr_digits_shift },
     /* EL */ { hw_el_lower,  hw_el_upper,  hw_el_digits,   hw_el_digits_shift },
     /* AR */ { hw_ar_lower,  hw_ar_lower,  hw_ar_digits,   hw_ar_digits },  // unicameral
+    /* FR */ { hw_fr_lower,  hw_fr_upper,  hw_fr_digits,   hw_fr_digits_shift },
 };
 
 const char* keyboardLayoutMapHwKey(KeyboardLayoutId id, int key, bool shifted) {

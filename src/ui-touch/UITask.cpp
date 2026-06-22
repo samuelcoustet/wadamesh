@@ -6963,9 +6963,9 @@ static void buildDeviceSettings(int sec) {
     uint16_t en_mask = 0;
 #endif
     /* One row per non-English layout; index id-1 into the display names.
-       Keep in KeyboardLayoutId order (BG=1 .. AR=6). */
+       Keep in KeyboardLayoutId order (BG=1 .. FR=7). */
     static const char* k_kb_disp[] = {
-      "Bulgarian", "Russian", "Ukrainian", "Serbian", "Greek", "Arabic (experimental)"
+      "Bulgarian", "Russian", "Ukrainian", "Serbian", "Greek", "Arabic (experimental)", "French (AZERTY)"
     };
     for (int id = 1; id < KEYBOARD_LAYOUT_COUNT; ++id) {
       int h = settingsRowLabel(body, y, 4, k_kb_disp[id - 1], COLOR_TEXT, &g_font_12, 56);
