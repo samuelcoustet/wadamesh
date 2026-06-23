@@ -140,6 +140,83 @@ constexpr const char* k_ui_threads_path = "/ui_threads_v1.bin";
 constexpr const char* k_ui_msgs_path    = "/ui_msgs_v1.bin";
 constexpr uint32_t k_ui_threads_magic   = 0x55495448;  // "UITH"
 constexpr uint32_t k_ui_msgs_magic      = 0x55494D53;  // "UIMS"
+constexpr const char* k_ui_waypoints_path = "/ui_waypoints_v1.bin";
+constexpr const char* k_ui_track_path     = "/ui_track_points_v1.csv";
+constexpr uint32_t k_ui_waypoints_magic   = 0x55495750;  // "UIWP"
+constexpr uint16_t k_ui_waypoints_version = 1;
+
+constexpr int k_local_waypoints_max = 16;
+constexpr int k_track_sample_every_ms = 10000;
+constexpr float k_track_move_min_m = 8.0f;
+constexpr float k_track_batt_low_v = 3.55f;
+
+enum WaypointPromptMode : uint8_t {
+  WP_PROMPT_NONE = 0,
+  WP_PROMPT_RENAME,
+  WP_PROMPT_NOTE,
+};
+
+struct __attribute__((packed)) UiWaypointFileHeader {
+  uint32_t magic;
+  uint16_t version;
+  uint16_t rec_size;
+  uint16_t count;
+  uint16_t selected_idx;
+};
+
+struct __attribute__((packed)) UiWaypointRec {
+  uint8_t  used;
+  uint8_t  flags;     // bit0 = rally
+  int32_t  lat_e6;
+  int32_t  lon_e6;
+  uint32_t created_ts;
+  char     name[24];
+  char     note[48];
+};
+
+struct LocalWaypoint {
+  bool     used = false;
+  bool     rally = false;
+  int32_t  lat_e6 = 0;
+  int32_t  lon_e6 = 0;
+  uint32_t created_ts = 0;
+  char     name[24] = {0};
+  char     note[48] = {0};
+};
+
+static LocalWaypoint s_waypoints[k_local_waypoints_max] = {};
+static bool     s_waypoints_loaded = false;
+static bool     s_waypoints_dirty = false;
+static int      s_waypoint_selected = -1;
+static int      s_waypoint_prompt_idx = -1;
+static uint8_t  s_waypoint_prompt_mode = WP_PROMPT_NONE;
+static lv_obj_t* s_waypoint_mgr_body = nullptr;
+static lv_obj_t* s_waypoint_mgr_list = nullptr;
+static lv_obj_t* s_waypoint_mgr_status = nullptr;
+static lv_obj_t* s_tile_queue_body = nullptr;
+static lv_obj_t* s_tile_queue_list = nullptr;
+static lv_obj_t* s_tile_queue_status = nullptr;
+static lv_obj_t* s_tile_queue_pause_btn = nullptr;
+static int      s_nav_target_wp = -1;
+
+static bool     s_track_recording = false;
+static bool     s_track_has_points = false;
+static bool     s_track_low_batt_alerted = false;
+static unsigned long s_track_last_sample_ms = 0;
+static double   s_track_last_lat = 0.0;
+static double   s_track_last_lon = 0.0;
+static float    s_track_total_km = 0.0f;
+static uint32_t s_track_point_count = 0;
+static int16_t  s_track_alt_min_m = INT16_MAX;
+static int16_t  s_track_alt_max_m = INT16_MIN;
+
+static unsigned long s_gps_last_fix_ms = 0;
+static unsigned long s_gps_last_loss_ms = 0;
+static double   s_gps_last_calc_lat = 0.0;
+static double   s_gps_last_calc_lon = 0.0;
+static unsigned long s_gps_last_calc_ms = 0;
+static float    s_gps_speed_kmh = 0.0f;
+static float    s_gps_course_deg = -1.0f;
 
 struct __attribute__((packed)) UiHistoryHeader {
   uint32_t magic;
@@ -1451,8 +1528,22 @@ static constexpr unsigned long kHomeEnvSampleMs = 15000;
 static uint16_t s_home_env_hist_batt_mv[kHomeEnvHistoryPoints] = {};
 static int16_t  s_home_env_hist_temp_t10[kHomeEnvHistoryPoints] = {};
 static int16_t  s_home_env_hist_hum[kHomeEnvHistoryPoints] = {};
+static int16_t  s_home_env_hist_press_hpa10[kHomeEnvHistoryPoints] = {};
+static int16_t  s_home_env_hist_alt_m[kHomeEnvHistoryPoints] = {};
 static bool     s_home_env_hist_seeded = false;
 static unsigned long s_home_env_last_sample_ms = 0;
+static constexpr int kPressureAlarmHistoryPoints = 120;   // 120 * 15 s = 30 min
+static int16_t  s_press_alarm_hist_hpa10[kPressureAlarmHistoryPoints] = {};
+static uint32_t s_press_alarm_hist_ms[kPressureAlarmHistoryPoints] = {};
+static bool     s_press_alarm_seeded = false;
+static bool     s_pressure_alarm_active = false;
+static unsigned long s_pressure_alarm_last_ms = 0;
+static int16_t  s_pressure_alarm_last_drop_hpa10 = 0;
+static uint16_t s_pressure_alarm_last_window_min = 0;
+static constexpr int16_t kPressureAlarmDropHpa10 = 15;      // 1.5 hPa / 30 min
+static constexpr uint32_t kPressureAlarmWindowMs = 30UL * 60UL * 1000UL;
+static constexpr uint32_t kPressureAlarmMinAgeMs = 15UL * 60UL * 1000UL;
+static constexpr uint32_t kPressureAlarmCooldownMs = 30UL * 60UL * 1000UL;
 
 static bool localEnvHasAnySensors(const UITask::LocalEnvSnapshot& snap) {
   return snap.have_batt || snap.have_bme_temp || snap.have_bme_hum || snap.have_bme_pressure ||
@@ -1507,6 +1598,8 @@ static void localEnvAppendHistorySparkU16(char* out, size_t cap, const char* lab
   out[p] = '\0';
 }
 
+static const char* bearingCardinal(double deg);  // defined at waypoint section below
+
 static void buildLocalEnvDetailText(const UITask::LocalEnvSnapshot& snap, char* out, size_t cap) {
   if (!out || cap == 0) return;
   out[0] = '\0';
@@ -1533,6 +1626,26 @@ static void buildLocalEnvDetailText(const UITask::LocalEnvSnapshot& snap, char* 
     p = localEnvAppendLine(out, cap, p, "\n  State %s", snap.gps_enabled ? "enabled" : "disabled");
     if (snap.gps_sats >= 0) p = localEnvAppendLine(out, cap, p, "  Sats %d", snap.gps_sats);
     p = localEnvAppendLine(out, cap, p, "  Fix %s", snap.gps_fix ? "yes" : "no");
+    if (s_gps_speed_kmh > 0.1f) p = localEnvAppendLine(out, cap, p, "\n  Speed %.1f km/h", (double)s_gps_speed_kmh);
+    if (s_gps_course_deg >= 0.0f) p = localEnvAppendLine(out, cap, p, "  Course %.0f\xC2\xB0 %s",
+                                                          (double)s_gps_course_deg, bearingCardinal(s_gps_course_deg));
+    p = localEnvAppendLine(out, cap, p, "\n  HDOP unavailable");
+    if (g_lv.task) {
+      p = localEnvAppendLine(out, cap, p, "  Seen this boot %s", g_lv.task->getGpsHadFix() ? "yes" : "no");
+      if (s_gps_last_fix_ms != 0)
+        p = localEnvAppendLine(out, cap, p, "\n  Last fix age %lus",
+                               (unsigned long)((millis() - s_gps_last_fix_ms) / 1000UL));
+      if (!snap.gps_fix && s_gps_last_loss_ms != 0)
+        p = localEnvAppendLine(out, cap, p, "  Lost %lus ago",
+                               (unsigned long)((millis() - s_gps_last_loss_ms) / 1000UL));
+      if (snap.gps_fix) {
+        p = localEnvAppendLine(out, cap, p, "\n  Live %.5f, %.5f",
+                               g_lv.task->getNodeLat(), g_lv.task->getNodeLon());
+      } else if (g_lv.task->getNodeLat() != 0.0 || g_lv.task->getNodeLon() != 0.0) {
+        p = localEnvAppendLine(out, cap, p, "\n  Saved %.5f, %.5f",
+                               g_lv.task->getNodeLat(), g_lv.task->getNodeLon());
+      }
+    }
   }
 
   p = localEnvAppendLine(out, cap, p, "\nBuzzer module: %s", snap.buzzer_available ? "available" : "not detected");
@@ -2756,6 +2869,26 @@ static volatile bool s_wifiscan_done    = false;   // worker -> UI: results read
 static lv_obj_t*     s_wifi_scan_list   = nullptr; // results list (inside the scan popup)
 static lv_obj_t*     s_wifi_scan_popup  = nullptr; // full-screen scan overlay (covers bar + sub-tabs)
 static bool ensureTileFetchTaskRunning();          // fwd: respawn the core-0 worker if it idled out
+
+// ---- Map-center state (declared here; used by waypoint manager before the map section) ----
+static double   s_map_center_lat = 0.0;
+static double   s_map_center_lon = 0.0;
+static bool     s_map_view_inited = false;
+
+// ---- Forward declarations for Codex-added features (defined below their first call sites) ----
+static void   ensureWaypointsLoaded();
+static int    findRallyWaypoint();
+static bool   saveWaypointsToStorage();
+static void   setWaypointSelected(int idx);
+static bool   addWaypointAt(double lat, double lon, bool rally, const char* name, const char* note);
+static void   deleteWaypoint(int idx);
+static void   resetTrackState(bool clear_file);
+static const char* waypointDisplayName(const LocalWaypoint& wp);
+static void   actionSheetShareSelectedWpCb(lv_event_t* e);
+static void   actionSheetShareRallyCb(lv_event_t* e);
+static double bearingDegrees(double lat1, double lon1, double lat2, double lon2);
+static bool   exportTrackToGpx(char* out_path, size_t out_cap);
+static bool   sendWaypointToContact(uint32_t mesh_idx, const LocalWaypoint& wp);
 
 // ---- First-boot setup wizard (welcome -> name -> region -> Wi-Fi). Shown once
 // on a fresh flash; gated by touchPrefsGetSetupDone(). s_setup_root is declared
@@ -4650,6 +4783,19 @@ static void toggleMentionSoundCb(lv_event_t* e) {
   const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
   touchPrefsSetSoundMentions(on);
   if (on) uiPlayMention();
+}
+
+static void toggleWeatherAlarmCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+  touchPrefsSetWeatherAlarm(on);
+}
+
+static void toggleWeatherAlarmSoundCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+  touchPrefsSetWeatherAlarmSound(on);
+  if (on && g_lv.task && !g_lv.task->isBuzzerQuiet()) uiPlayMention();
 }
 #if defined(HAS_TDECK_GT911)
 // Volume +/- step buttons (user_data = step, e.g. +10 / -10). Clamps 0..100,
@@ -6925,22 +7071,6 @@ static void kbLayoutSwitchCb(lv_event_t* e) {
   }
 }
 
-static lv_obj_t* s_orient_row = nullptr;  // Orientation button — disabled when rotation is locked
-
-// Rotation lock toggle: when locked the orientation button is disabled live.
-static void rotLockToggleCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
-  lv_obj_t* sw = lv_event_get_target(e);
-  const bool locked = !lv_obj_has_state(sw, LV_STATE_CHECKED);   // checked = auto-rotation ON = not locked
-#if defined(ESP32)
-  touchPrefsSetRotLock(locked);
-#endif
-  if (s_orient_row) {
-    if (locked) lv_obj_add_state(s_orient_row, LV_STATE_DISABLED);
-    else        lv_obj_clear_state(s_orient_row, LV_STATE_DISABLED);
-  }
-}
-
 // Screen orientation: the persistent base rotation, applied at boot. Tapping
 // cycles Portrait -> Landscape -> Landscape (flipped) and reboots so the whole
 // UI rebuilds at the chosen resolution (rebootDevice() saves chat history
@@ -7430,6 +7560,22 @@ static void buildDeviceSettings(int sec) {
     lv_obj_add_event_cb(sw, toggleMentionSoundCb, LV_EVENT_VALUE_CHANGED, nullptr);
     y += LV_MAX(34, rh + 12);
   }
+  {
+    int rh = settingsRowLabel(body, y, 6, "Weather pressure alert", COLOR_SUB, nullptr, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+    if (touchPrefsGetWeatherAlarm()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, toggleWeatherAlarmCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(34, rh + 12);
+  }
+  {
+    int rh = settingsRowLabel(body, y, 6, "Weather alert sound", COLOR_SUB, nullptr, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+    if (touchPrefsGetWeatherAlarmSound()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, toggleWeatherAlarmSoundCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(34, rh + 12);
+  }
 #if defined(HAS_TDECK_GT911)
   // Volume with - / + step buttons (T-Deck I2S; the V4 piezo can't vary volume).
   {
@@ -7601,21 +7747,6 @@ static void buildDeviceSettings(int sec) {
     lv_obj_set_style_bg_color(swatch, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(swatch, LV_OPA_COVER, LV_PART_MAIN);
     y += SC(40);
-  }
-
-  /* Auto-rotation: when OFF (toggle unchecked) the screen is locked to the
-     current orientation and the rotate button is hidden. Default ON. */
-  {
-    int h = settingsRowLabel(body, y, 6, TR("Auto-rotation"), COLOR_SUB, nullptr, 56);
-    lv_obj_t* sw = lv_switch_create(body);
-    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
-#if defined(ESP32)
-    if (!touchPrefsGetRotLock()) lv_obj_add_state(sw, LV_STATE_CHECKED);
-#else
-    lv_obj_add_state(sw, LV_STATE_CHECKED);
-#endif
-    lv_obj_add_event_cb(sw, rotLockToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
-    y += LV_MAX(40, h + 12);
   }
 
   }
@@ -7798,8 +7929,7 @@ static void buildDeviceSettings(int sec) {
 
   if (sec == DSEC_DISPLAY) {   // --- Orientation (display) ---
   /* Screen orientation. Cycles Portrait -> Landscape -> Landscape (flipped);
-     applied at boot, so tapping reboots the device.
-     s_orient_row holds the button — disabled live by rotLockToggleCb when locked. */
+     applied at boot, so tapping reboots the device. */
   {
     y += settingsRowLabel(body, y, 0, "Orientation (tap to rotate, reboots)", COLOR_SUB, &g_font_12, 0) + 2;
     lv_obj_t* b_rot = lv_btn_create(body);
@@ -7810,10 +7940,6 @@ static void buildDeviceSettings(int sec) {
     lv_obj_t* lr = lv_label_create(b_rot);
     lv_label_set_text(lr, uiRotationLabel());
     lv_obj_center(lr);
-    s_orient_row = b_rot;
-#if defined(ESP32)
-    if (touchPrefsGetRotLock()) lv_obj_add_state(b_rot, LV_STATE_DISABLED);
-#endif
     y += SC(42);
   }
 
@@ -10521,10 +10647,16 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   // both this contact and our node have a GPS fix.
   bool has_los = false;
   bool is_room = false;
+  bool has_sel_wp = false;
+  bool has_rally_wp = false;
   {
     ContactInfo _tc;
     if (the_mesh.getContactByIdx(mesh_idx, _tc)) is_room = (_tc.type == ADV_TYPE_ROOM);
   }
+  ensureWaypointsLoaded();
+  has_sel_wp = (s_waypoint_selected >= 0 && s_waypoint_selected < k_local_waypoints_max &&
+                s_waypoints[s_waypoint_selected].used);
+  has_rally_wp = (findRallyWaypoint() >= 0);
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
   {
     ContactInfo _lc;
@@ -10539,7 +10671,8 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   // bottom row. Grid items = msg/ping + telemetry + range + favorite + reset +
   // block (6), + trace/admin for repeaters (2), + Join for rooms (1), +
   // line-of-sight (1).
-  const int grid_items = (from_map ? 5 : 6) + (is_repeater ? 2 : 0) + (is_room ? 1 : 0) + (has_los ? 1 : 0);
+  const int grid_items = (from_map ? 5 : 6) + (is_repeater ? 2 : 0) + (is_room ? 1 : 0) +
+                         (has_los ? 1 : 0) + (has_sel_wp ? 1 : 0) + (has_rally_wp ? 1 : 0);
   const int grid_rows  = (grid_items + 1) / 2;          // ceil
   const int card_h = title_h + (grid_rows + 1) * (btn_h + btn_gap) + padding;
   lv_obj_t* card = lv_obj_create(s_action_sheet_root);
@@ -10638,6 +10771,8 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   // Terrain-aware line-of-sight (needs both GPS fixes; gated by has_los).
   if (has_los) mk_btn(LV_SYMBOL_GPS "  Sightline", actionSheetLosCb, 0);
 #endif
+  if (has_sel_wp) mk_btn(LV_SYMBOL_UPLOAD "  Send waypoint", actionSheetShareSelectedWpCb, 0);
+  if (has_rally_wp) mk_btn(LV_SYMBOL_UPLOAD "  Send rally", actionSheetShareRallyCb, 0);
   // Favorite toggle: label flips based on current state.
 #if defined(ESP32)
   bool _is_fav_now = false;
@@ -12302,6 +12437,13 @@ static void closeFullscreenView() {
   if (s_fm_prompt)  { lv_obj_del_async(s_fm_prompt);  s_fm_prompt  = nullptr; }
   s_term_log_box   = nullptr;
   s_term_input_ta  = nullptr;
+  s_waypoint_mgr_body = nullptr;
+  s_waypoint_mgr_list = nullptr;
+  s_waypoint_mgr_status = nullptr;
+  s_tile_queue_body = nullptr;
+  s_tile_queue_list = nullptr;
+  s_tile_queue_status = nullptr;
+  s_tile_queue_pause_btn = nullptr;
   s_fm_list        = nullptr;   // file-manager widgets live in the same body
   s_fm_path_lbl    = nullptr;
   s_fm_search_ta   = nullptr;
@@ -13191,6 +13333,270 @@ static void fmTextPrompt(const char* title, const char* initial, void (*cb)(cons
   lv_obj_t* lo = lv_label_create(bo); lv_label_set_text(lo, TR("OK")); lv_obj_center(lo);
 
   if (g_lv.keyboard) kbMirrorBind(s_fm_prompt_ta);
+}
+
+static void refreshWaypointManager();
+
+static void waypointPromptApply(const char* text) {
+  ensureWaypointsLoaded();
+  if (s_waypoint_prompt_idx < 0 || s_waypoint_prompt_idx >= k_local_waypoints_max ||
+      !s_waypoints[s_waypoint_prompt_idx].used) return;
+  if (s_waypoint_prompt_mode == WP_PROMPT_RENAME) {
+    snprintf(s_waypoints[s_waypoint_prompt_idx].name, sizeof s_waypoints[s_waypoint_prompt_idx].name, "%s", text ? text : "");
+  } else if (s_waypoint_prompt_mode == WP_PROMPT_NOTE) {
+    snprintf(s_waypoints[s_waypoint_prompt_idx].note, sizeof s_waypoints[s_waypoint_prompt_idx].note, "%s", text ? text : "");
+  }
+  saveWaypointsToStorage();
+  refreshWaypointManager();
+}
+
+static void waypointSelectRowCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  ensureWaypointsLoaded();
+  if (idx < 0 || idx >= k_local_waypoints_max || !s_waypoints[idx].used) return;
+  setWaypointSelected(idx);
+  const LocalWaypoint& wp = s_waypoints[idx];
+  s_map_center_lat = (double)wp.lat_e6 / 1.0e6;
+  s_map_center_lon = (double)wp.lon_e6 / 1.0e6;
+  s_map_view_inited = true;
+  renderMapTiles();
+  renderMapMarkers();
+  refreshMapInfoLabel();
+  if (g_lv.tabview) lv_tabview_set_act(g_lv.tabview, MAP_TAB_INDEX, LV_ANIM_OFF);
+  refreshWaypointManager();
+}
+
+static void waypointAddCurrentCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  const double lat = g_lv.task->getNodeLat();
+  const double lon = g_lv.task->getNodeLon();
+  if (!addWaypointAt(lat, lon, false, nullptr, "")) {
+    g_lv.task->showAlert(TR("Unable to add waypoint"), 1500);
+    return;
+  }
+  renderMapMarkers();
+  refreshMapInfoLabel();
+  refreshWaypointManager();
+}
+
+static void waypointSetRallyCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  const double lat = g_lv.task->getNodeLat();
+  const double lon = g_lv.task->getNodeLon();
+  if (!addWaypointAt(lat, lon, true, "Rally point", "Return / breadcrumb")) {
+    g_lv.task->showAlert(TR("Unable to set rally point"), 1500);
+    return;
+  }
+  renderMapMarkers();
+  refreshMapInfoLabel();
+  refreshWaypointManager();
+}
+
+static void waypointRenameCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  ensureWaypointsLoaded();
+  if (s_waypoint_selected < 0 || !s_waypoints[s_waypoint_selected].used) return;
+  s_waypoint_prompt_idx = s_waypoint_selected;
+  s_waypoint_prompt_mode = WP_PROMPT_RENAME;
+  fmTextPrompt("Waypoint name", s_waypoints[s_waypoint_selected].name, waypointPromptApply);
+}
+
+static void waypointNoteCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  ensureWaypointsLoaded();
+  if (s_waypoint_selected < 0 || !s_waypoints[s_waypoint_selected].used) return;
+  s_waypoint_prompt_idx = s_waypoint_selected;
+  s_waypoint_prompt_mode = WP_PROMPT_NOTE;
+  fmTextPrompt("Waypoint note", s_waypoints[s_waypoint_selected].note, waypointPromptApply);
+}
+
+static void waypointDeleteApply() {
+  deleteWaypoint(s_waypoint_selected);
+  renderMapMarkers();
+  refreshMapInfoLabel();
+  refreshWaypointManager();
+}
+
+static void waypointDeleteCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  ensureWaypointsLoaded();
+  if (s_waypoint_selected < 0 || !s_waypoints[s_waypoint_selected].used) return;
+  char msg[96];
+  snprintf(msg, sizeof msg, "Delete %s?", waypointDisplayName(s_waypoints[s_waypoint_selected]));
+  showConfirm(msg, "Delete", waypointDeleteApply);
+}
+
+static void trackToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  if (!s_track_recording) {
+    resetTrackState(true);
+    s_track_recording = true;
+    if (findRallyWaypoint() < 0) {
+      addWaypointAt(g_lv.task->getNodeLat(), g_lv.task->getNodeLon(), true, "Rally point", "Start / return point");
+    }
+    g_lv.task->showAlert(TR("Track recording started"), 1400);
+  } else {
+    s_track_recording = false;
+    g_lv.task->showAlert(TR("Track recording stopped"), 1400);
+  }
+  refreshMapInfoLabel();
+  refreshWaypointManager();
+}
+
+static void trackExportCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  char path[120];
+  if (exportTrackToGpx(path, sizeof path)) g_lv.task->showAlert(path, 2600);
+  else g_lv.task->showAlert(TR("GPX export failed"), 1800);
+}
+
+static void refreshWaypointManager() {
+  if (!s_waypoint_mgr_body || !s_waypoint_mgr_list) return;
+  ensureWaypointsLoaded();
+  lv_obj_clean(s_waypoint_mgr_list);
+  const double self_lat = g_lv.task ? g_lv.task->getNodeLat() : 0.0;
+  const double self_lon = g_lv.task ? g_lv.task->getNodeLon() : 0.0;
+  int used_count = 0;
+  for (int i = 0; i < k_local_waypoints_max; ++i) {
+    const LocalWaypoint& wp = s_waypoints[i];
+    if (!wp.used) continue;
+    ++used_count;
+    lv_obj_t* btn = lv_btn_create(s_waypoint_mgr_list);
+    lv_obj_set_width(btn, lv_pct(100));
+    lv_obj_set_height(btn, 56);
+    styleButton(btn);
+    if (i == s_waypoint_selected) {
+      lv_obj_set_style_bg_color(btn, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+      lv_obj_set_style_bg_opa(btn, LV_OPA_30, LV_PART_MAIN);
+    }
+    lv_obj_add_event_cb(btn, waypointSelectRowCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+    char row[160];
+    const double lat = (double)wp.lat_e6 / 1.0e6;
+    const double lon = (double)wp.lon_e6 / 1.0e6;
+    char dist[32] = "";
+    if (!(self_lat == 0.0 && self_lon == 0.0)) {
+      const double km = contactDistanceKm(self_lat, self_lon, lat, lon);
+      const double brg = bearingDegrees(self_lat, self_lon, lat, lon);
+      if (km < 1.0) snprintf(dist, sizeof dist, "%dm %s", (int)(km * 1000.0 + 0.5), bearingCardinal(brg));
+      else          snprintf(dist, sizeof dist, "%.1fkm %s", km, bearingCardinal(brg));
+    }
+    snprintf(row, sizeof row, "%s%s%s\n%.5f, %.5f%s%s",
+             wp.rally ? "[RP] " : "",
+             waypointDisplayName(wp),
+             dist[0] ? "" : "",
+             lat, lon,
+             dist[0] ? "  " : "",
+             dist);
+    lv_obj_t* lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, row);
+    lv_obj_set_style_text_font(lbl, &g_font_12, LV_PART_MAIN);
+    lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 6, 0);
+    if (wp.note[0]) {
+      lv_obj_t* note = lv_label_create(btn);
+      lv_label_set_text(note, wp.note);
+      lv_obj_set_style_text_font(note, &g_font_12, LV_PART_MAIN);
+      lv_obj_set_style_text_color(note, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+      lv_obj_align(note, LV_ALIGN_BOTTOM_LEFT, 6, -4);
+    }
+  }
+  if (s_waypoint_mgr_status) {
+    char status[160];
+    if (s_track_recording) {
+      snprintf(status, sizeof status, "REC %.1fkm  %lu pt  alt %d..%d m",
+               (double)s_track_total_km, (unsigned long)s_track_point_count,
+               s_track_alt_min_m == INT16_MAX ? 0 : (int)s_track_alt_min_m,
+               s_track_alt_max_m == INT16_MIN ? 0 : (int)s_track_alt_max_m);
+    } else if (s_waypoint_selected >= 0 && s_waypoints[s_waypoint_selected].used) {
+      const LocalWaypoint& wp = s_waypoints[s_waypoint_selected];
+      snprintf(status, sizeof status, "%s%s",
+               wp.rally ? "Rally selected  " : "Waypoint selected  ",
+               wp.note[0] ? wp.note : "tap a row to jump to map");
+    } else {
+      snprintf(status, sizeof status, "Waypoints %d/%d  Track %s",
+               used_count,
+               k_local_waypoints_max,
+               s_track_has_points ? "ready to export" : "idle");
+    }
+    lv_label_set_text(s_waypoint_mgr_status, status);
+  }
+}
+
+static void actionSheetShareSelectedWpCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  ensureWaypointsLoaded();
+  const int idx = s_waypoint_selected;
+  closeActionSheet();
+  if (idx < 0 || idx >= k_local_waypoints_max || !s_waypoints[idx].used) {
+    g_lv.task->showAlert(TR("No selected waypoint"), 1400);
+    return;
+  }
+  if (sendWaypointToContact((uint32_t)s_action_sheet_mesh_idx, s_waypoints[idx]))
+    g_lv.task->showAlert(TR("Waypoint sent"), 1400);
+  else
+    g_lv.task->showAlert(TR("Waypoint send failed"), 1600);
+}
+
+static void actionSheetShareRallyCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  ensureWaypointsLoaded();
+  const int idx = findRallyWaypoint();
+  closeActionSheet();
+  if (idx < 0 || !s_waypoints[idx].used) {
+    g_lv.task->showAlert(TR("No rally point"), 1400);
+    return;
+  }
+  if (sendWaypointToContact((uint32_t)s_action_sheet_mesh_idx, s_waypoints[idx]))
+    g_lv.task->showAlert(TR("Rally point sent"), 1400);
+  else
+    g_lv.task->showAlert(TR("Rally send failed"), 1600);
+}
+
+static void openWaypointManager() {
+  lv_obj_t* body = openFullscreenView("Waypoints");
+  s_waypoint_mgr_body = body;
+  lv_obj_set_style_pad_all(body, 6, LV_PART_MAIN);
+
+  lv_obj_t* row = lv_obj_create(body);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, lv_pct(100), 76);
+  lv_obj_set_pos(row, 0, 0);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+  auto mk = [&](const char* txt, int x, int y, int w, lv_event_cb_t cb, uint32_t bg = COLOR_PANEL) {
+    lv_obj_t* b = lv_btn_create(row);
+    lv_obj_set_size(b, w, 32);
+    lv_obj_set_pos(b, x, y);
+    styleButton(b);
+    lv_obj_set_style_bg_color(b, lv_color_hex(bg), LV_PART_MAIN);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_obj_center(l);
+  };
+  mk("Add here", 0, 0, 68, waypointAddCurrentCb);
+  mk("Rally", 72, 0, 52, waypointSetRallyCb, 0xA54242);
+  mk(s_track_recording ? "Stop" : "Track", 128, 0, 54, trackToggleCb, s_track_recording ? 0xA54242 : COLOR_STATUS_OK);
+  mk("GPX", 186, 0, 42, trackExportCb, 0x2E6D91);
+  mk("Rename", 0, 38, 68, waypointRenameCb);
+  mk("Note", 72, 38, 52, waypointNoteCb);
+  mk("Delete", 128, 38, 54, waypointDeleteCb, 0x7A2E2E);
+
+  s_waypoint_mgr_status = lv_label_create(body);
+  lv_obj_set_width(s_waypoint_mgr_status, lv_pct(100));
+  lv_obj_set_pos(s_waypoint_mgr_status, 0, 80);
+  lv_obj_set_style_text_font(s_waypoint_mgr_status, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_waypoint_mgr_status, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+
+  s_waypoint_mgr_list = lv_list_create(body);
+  const lv_coord_t list_h = LV_MAX((lv_coord_t)80,
+                                   (lv_coord_t)(lv_disp_get_ver_res(nullptr) - STATUSBAR_H - 118));
+  lv_obj_set_size(s_waypoint_mgr_list, lv_pct(100), list_h);
+  lv_obj_set_pos(s_waypoint_mgr_list, 0, 104);
+  lv_obj_set_style_bg_color(s_waypoint_mgr_list, lv_color_hex(COLOR_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_width(s_waypoint_mgr_list, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(s_waypoint_mgr_list, 0, LV_PART_MAIN);
+  refreshWaypointManager();
 }
 
 // ----- operations (act on s_fm_sel_name in the current dir) -----
@@ -15977,6 +16383,12 @@ static inline void tileCacheMkdir(const char* rel) {
   char p[80]; snprintf(p, sizeof p, "%s%s", s_tile_root, rel);
   s_tile_fs->mkdir(p);
 }
+static inline void tileCacheRmdir(const char* rel) {
+  if (!s_tile_fs) return;
+  tileCacheMarkSdIo();
+  char p[80]; snprintf(p, sizeof p, "%s%s", s_tile_root, rel);
+  s_tile_fs->rmdir(p);
+}
 
 // True when the LittleFS tile cache is nearly full. A FULL/fragmented LittleFS
 // FAULTS inside lfs_alloc during mkdir (coredump 2026-06-14: reboot while a
@@ -16085,6 +16497,83 @@ static bool tileFetchSeen(uint8_t z, int32_t x, int32_t y) {
 static void tileFetchMarkSeen(uint8_t z, int32_t x, int32_t y) {
   s_tile_fetch_dedup[s_tile_fetch_dedup_head] = tileFetchDedupKey(z, x, y);
   s_tile_fetch_dedup_head = (s_tile_fetch_dedup_head + 1) % k_tile_fetch_dedup_size;
+}
+static void tileFetchForget(uint8_t z, int32_t x, int32_t y) {
+  const uint32_t k = tileFetchDedupKey(z, x, y);
+  for (int i = 0; i < k_tile_fetch_dedup_size; ++i)
+    if (s_tile_fetch_dedup[i] == k) s_tile_fetch_dedup[i] = 0;
+}
+
+struct TileFetchUiEntry {
+  bool     used = false;
+  uint8_t  z = 0;
+  int32_t  x = 0;
+  int32_t  y = 0;
+  uint8_t  tries = 0;
+  char     state = '-';   // q/g/w/e/P/H/S/W/J/!
+  int16_t  http_code = 0;
+  uint32_t stamp_ms = 0;
+};
+static constexpr int k_tile_fetch_ui_hist = 24;
+static TileFetchUiEntry s_tile_fetch_ui[k_tile_fetch_ui_hist] = {};
+static uint8_t  s_tile_fetch_ui_head = 0;
+static bool     s_tile_fetch_paused = false;
+
+static TileFetchUiEntry* tileFetchUiFind(uint8_t z, int32_t x, int32_t y) {
+  for (int i = 0; i < k_tile_fetch_ui_hist; ++i) {
+    TileFetchUiEntry& e = s_tile_fetch_ui[i];
+    if (e.used && e.z == z && e.x == x && e.y == y) return &e;
+  }
+  return nullptr;
+}
+
+static TileFetchUiEntry& tileFetchUiAlloc(uint8_t z, int32_t x, int32_t y) {
+  TileFetchUiEntry* hit = tileFetchUiFind(z, x, y);
+  if (hit) return *hit;
+  TileFetchUiEntry& e = s_tile_fetch_ui[s_tile_fetch_ui_head];
+  s_tile_fetch_ui_head = (uint8_t)((s_tile_fetch_ui_head + 1) % k_tile_fetch_ui_hist);
+  e = TileFetchUiEntry{};
+  e.used = true;
+  e.z = z;
+  e.x = x;
+  e.y = y;
+  return e;
+}
+
+static void tileFetchUiMark(uint8_t z, int32_t x, int32_t y, char state, int16_t http_code = 0, bool bump_try = false) {
+  TileFetchUiEntry& e = tileFetchUiAlloc(z, x, y);
+  e.state = state;
+  e.http_code = http_code;
+  e.stamp_ms = millis();
+  if (bump_try && e.tries < 255) ++e.tries;
+}
+
+static const char* tileFetchStateText(char state) {
+  switch (state) {
+    case 'q': return "queued";
+    case 'g': return "fetching";
+    case 'w': return "cached";
+    case 'e': return "http error";
+    case 'P': return "write error";
+    case 'O': return "open failed";
+    case 'H': return "low heap";
+    case 'S': return "cache full";
+    case 'W': return "wifi down";
+    case 'J': return "bad jpeg";
+    case 'Z': return "bad size";
+    case '!': return "skipped";
+    case 'p': return "paused";
+    default:  return "pending";
+  }
+}
+
+static bool tileFetchStateIsFailure(char state) {
+  return state == 'e' || state == 'P' || state == 'O' || state == 'H' ||
+         state == 'S' || state == 'W' || state == 'J' || state == 'Z' || state == '!';
+}
+
+static bool tileFetchStateIsDone(char state) {
+  return state == 'w' || tileFetchStateIsFailure(state);
 }
 #endif  // MULTI_TRANSPORT_COMPANION
 #endif  // ESP32
@@ -16310,10 +16799,8 @@ static uint8_t* decodeJpegScaledToRgb565(const uint8_t* jpeg, size_t jpeg_len,
   *out_w = ow; *out_h = oh;
   return (uint8_t*)buf;
 }
-static double   s_map_center_lat = 0.0;
-static double   s_map_center_lon = 0.0;
+// s_map_center_lat / s_map_center_lon / s_map_view_inited declared above (used by waypoint manager)
 static uint8_t  s_map_zoom       = k_map_zoom_default;
-static bool     s_map_view_inited = false;  // first map open did the recenter+zoom-snap; after that, remember the user's view (issue #5)
 static bool       s_map_follow     = false; // auto-follow: recenter on self whenever the GPS coords change
 static lv_obj_t*  s_map_follow_btn = nullptr;
 // Map zoom control style: false = slider (default, toggled by the on-map button),
@@ -16546,12 +17033,18 @@ static void tileFetchTaskFn(void* arg) {
       s_wifiscan_done  = true;
       continue;
     }
+    if (s_tile_fetch_paused) {
+      s_tile_fetch_step = 'p';
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
     s_tile_fetch_step = 'q';
     // Finite timeout (not portMAX_DELAY) so the loop wakes periodically to
     // pick up LOS requests even when no tiles are queued.
     if (xQueueReceive(s_tile_fetch_queue, &req, pdMS_TO_TICKS(250)) != pdTRUE) {
       continue;
     }
+    tileFetchUiMark(req.z, req.x, req.y, 'q');
     ++s_tile_fetch_iters;
     // Yield once per dequeued item: a burst of queued tiles that are already on
     // disk (the prefetch now enqueues without stat'ing) would otherwise be a
@@ -16562,6 +17055,7 @@ static void tileFetchTaskFn(void* arg) {
                     (unsigned)req.z, (long)req.x, (long)req.y);
       s_tile_fetch_step = '!';
       s_tile_fetch_last_wr = 'W';
+      tileFetchUiMark(req.z, req.x, req.y, 'W', 0, true);
       ++s_tile_fetch_failed;
       if (s_tile_fetch_pending > 0) --s_tile_fetch_pending;
       continue;
@@ -16589,6 +17083,7 @@ static void tileFetchTaskFn(void* arg) {
         vf.close();
       }
       if (good) {
+        tileFetchUiMark(req.z, req.x, req.y, 'w', 200);
         ++s_tile_fetch_ok;
         if (s_tile_fetch_pending > 0) --s_tile_fetch_pending;
         continue;
@@ -16619,6 +17114,7 @@ static void tileFetchTaskFn(void* arg) {
         // Still too tight — skip this tile; it'll be re-requested on the
         // next render miss. Keep counters coherent.
         s_tile_fetch_last_wr = 'H';
+        tileFetchUiMark(req.z, req.x, req.y, 'H', 0, true);
         ++s_tile_fetch_failed;
         if (s_tile_fetch_pending > 0) --s_tile_fetch_pending;
         continue;
@@ -16629,6 +17125,7 @@ static void tileFetchTaskFn(void* arg) {
     // during the dir mkdir below (reboot), instead of failing cleanly.
     if (tilesFsLowSpace()) {
       s_tile_fetch_last_wr = 'S';
+      tileFetchUiMark(req.z, req.x, req.y, 'S', 0, true);
       ++s_tile_fetch_failed;
       if (s_tile_fetch_pending > 0) --s_tile_fetch_pending;
       continue;
@@ -16661,6 +17158,7 @@ static void tileFetchTaskFn(void* arg) {
     http.addHeader("User-Agent", "wadamesh-touch/0.4 (https://github.com/ALLFATHER-BV/wadamesh)");
     Serial.printf("[TILE] GET %s\n", url);
     s_tile_fetch_step = 'g';
+    tileFetchUiMark(req.z, req.x, req.y, 'g');
     int code = http.GET();
     s_tile_fetch_last_code = (int16_t)code;
     Serial.printf("[TILE]  -> HTTP %d (size=%d)\n", code, http.getSize());
@@ -16668,6 +17166,7 @@ static void tileFetchTaskFn(void* arg) {
     if (code != HTTP_CODE_OK) {
       s_tile_fetch_step = 'd';
       s_tile_fetch_last_wr = 'e';                  // HTTP error (code shown as "http" on the map)
+      tileFetchUiMark(req.z, req.x, req.y, 'e', (int16_t)code, true);
     }
     if (code == HTTP_CODE_OK) {
       s_tile_fetch_step = 'r';
@@ -16716,17 +17215,21 @@ static void tileFetchTaskFn(void* arg) {
             tileCacheRemove(path_jpg);               // partial / bad / failed write — discard
             if (bad_content) {
               s_tile_fetch_last_wr = 'J';            // not a JPEG (proxy error page / blank body)
+              tileFetchUiMark(req.z, req.x, req.y, 'J', (int16_t)code, true);
             } else {
               ++s_tile_fetch_short_wr;
               s_tile_fetch_last_wr = 'P';            // short/failed disk write (card full or SD error)
+              tileFetchUiMark(req.z, req.x, req.y, 'P', (int16_t)code, true);
             }
           }
         } else {
           ++s_tile_fetch_open_fail;
           s_tile_fetch_last_wr = 'O';                // open("w") failed: dir missing / write-protect / SD bus
+          tileFetchUiMark(req.z, req.x, req.y, 'O', (int16_t)code, true);
         }
       } else {
         s_tile_fetch_last_wr = 'Z';                  // bad / oversized content-length
+        tileFetchUiMark(req.z, req.x, req.y, 'Z', (int16_t)code, true);
       }
     }
     // Close the socket and free its lwip buffers BEFORE we signal the
@@ -16742,6 +17245,7 @@ static void tileFetchTaskFn(void* arg) {
       Serial.printf("[TILE]  -> wrote %s\n", path_jpg);
       s_tile_fetch_step = 'w';
       s_tile_fetch_last_wr = 'w';
+      tileFetchUiMark(req.z, req.x, req.y, 'w', (int16_t)code, true);
       ++s_tile_fetch_ok;
       s_tile_fetch_dirty = true;        // render thread picks this up
     } else {
@@ -16805,6 +17309,7 @@ static bool ensureTileFetchTaskRunning() {
 
   s_tile_fetch_step     = '-';
   s_tile_fetch_spawn_ok = false;
+  s_tile_fetch_paused   = false;
 
   s_tile_fetch_task = xTaskCreateStaticPinnedToCore(
       tileFetchTaskFn, "tile_fetch",
@@ -16840,6 +17345,7 @@ static void queueTileForFetch(uint8_t z, int32_t x, int32_t y) {
   TileFetchReq req = {z, x, y};
   if (xQueueSend(s_tile_fetch_queue, &req, 0) == pdTRUE) {
     tileFetchMarkSeen(z, x, y);    // only remember it once it's truly queued
+    tileFetchUiMark(z, x, y, 'q');
     ++s_tile_fetch_pending;
   }
 }
@@ -17349,6 +17855,8 @@ static void renderMapTiles() {
 // when handling marker taps) — fine for at-most-32 visible markers.
 struct MapMarker {
   int       mesh_idx;   // ContactInfo index for real contacts; -1 for self
+  int       ref_idx;    // waypoint index when kind == waypoint
+  uint8_t   kind;       // 0 empty, 1 self, 2 contact, 3 waypoint
   lv_obj_t* obj;
 };
 constexpr int k_map_markers_max = 32;
@@ -17411,6 +17919,8 @@ static void freeMapMarkers() {
   for (auto& m : s_map_markers) {
     if (m.obj) { lv_obj_del(m.obj); m.obj = nullptr; }
     m.mesh_idx = -2;   // "slot empty" sentinel
+    m.ref_idx = -1;
+    m.kind = 0;
   }
   for (auto& ln : s_map_link_objs) {
     if (ln) { lv_obj_del(ln); ln = nullptr; }
@@ -17424,6 +17934,34 @@ static void freeMapMarkers() {
 static void openMarkerPopupForContact(int mesh_idx);
 static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const char* name, bool from_map);
 static void openMapPicker(const int* idxs, int n);
+static void openWaypointManager();
+static void openTileQueueManager();
+static int queueTileAreaToCurrentZoom();
+
+static void handleMapMarkerHit(int slot_idx) {
+  if (slot_idx < 0 || slot_idx >= k_map_markers_max) return;
+  const MapMarker& m = s_map_markers[slot_idx];
+  if (m.kind == 2) {
+    openMarkerPopupForContact(m.mesh_idx);
+  } else if (m.kind == 3 && m.ref_idx >= 0 && m.ref_idx < k_local_waypoints_max && s_waypoints[m.ref_idx].used) {
+    setWaypointSelected(m.ref_idx);
+    const LocalWaypoint& wp = s_waypoints[m.ref_idx];
+    s_map_center_lat = (double)wp.lat_e6 / 1.0e6;
+    s_map_center_lon = (double)wp.lon_e6 / 1.0e6;
+    s_map_view_inited = true;
+    renderMapTiles();
+    renderMapMarkers();
+    refreshMapInfoLabel();
+    if (g_lv.task) {
+      char msg[96];
+      snprintf(msg, sizeof msg, "%s%s%s",
+               wp.rally ? "Rally: " : "Waypoint: ",
+               waypointDisplayName(wp),
+               wp.note[0] ? " selected" : "");
+      g_lv.task->showAlert(msg, 1400);
+    }
+  }
+}
 // (onMapMarkerClickedCb removed — marker taps are now dispatched centrally
 // from the canvas's RELEASED handler in mapCanvasEventCb. See the marker
 // scan in the tap branch below.)
@@ -17501,6 +18039,8 @@ static void renderMapMarkers() {
       self_sy >= -10 && self_sy < k_map_canvas_h + 10) {
     MapMarker& m = s_map_markers[0];
     m.mesh_idx = -1;
+    m.ref_idx = -1;
+    m.kind = 1;
     m.obj = lv_label_create(parent);
     lv_label_set_text(m.obj, LV_SYMBOL_GPS);
     lv_obj_set_style_text_font(m.obj, &g_font_16, LV_PART_MAIN);
@@ -17537,6 +18077,8 @@ static void renderMapMarkers() {
 
     MapMarker& m = s_map_markers[slot];
     m.mesh_idx = (int)i;
+    m.ref_idx = -1;
+    m.kind = 2;
     m.obj = lv_obj_create(parent);
     lv_obj_remove_style_all(m.obj);
     lv_obj_set_size(m.obj, 14, 14);
@@ -17551,6 +18093,36 @@ static void renderMapMarkers() {
     // This makes overlapping markers selectable (disambiguation sheet) and
     // also lets panning that starts on a marker fall through to the canvas
     // pan handler instead of being swallowed by the marker.
+    lv_obj_clear_flag(m.obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(m.obj, LV_OBJ_FLAG_SCROLLABLE);
+    ++slot;
+  }
+
+  ensureWaypointsLoaded();
+  for (int i = 0; i < k_local_waypoints_max && slot < k_map_markers_max; ++i) {
+    const LocalWaypoint& wp = s_waypoints[i];
+    if (!wp.used || (wp.lat_e6 == 0 && wp.lon_e6 == 0)) continue;
+    const double lat = (double)wp.lat_e6 / 1.0e6;
+    const double lon = (double)wp.lon_e6 / 1.0e6;
+    double mwx, mwy;
+    latLonToWorldPx(lat, lon, s_map_zoom, &mwx, &mwy);
+    const int sx = (int)(mwx - cwx + k_map_canvas_w / 2);
+    const int sy = (int)(mwy - cwy + k_map_canvas_h / 2);
+    if (sx < -10 || sx >= k_map_canvas_w + 10 || sy < -10 || sy >= k_map_canvas_h + 10) continue;
+    MapMarker& m = s_map_markers[slot];
+    m.mesh_idx = -1;
+    m.ref_idx = i;
+    m.kind = 3;
+    m.obj = lv_obj_create(parent);
+    lv_obj_remove_style_all(m.obj);
+    lv_obj_set_size(m.obj, wp.rally ? 16 : 12, wp.rally ? 16 : 12);
+    lv_obj_set_pos(m.obj, sx - (wp.rally ? 8 : 6), sy - (wp.rally ? 8 : 6));
+    const uint32_t fill = (i == s_nav_target_wp) ? 0xF5A623 : (wp.rally ? 0xE24A4A : 0x79D36B);
+    lv_obj_set_style_bg_color(m.obj, lv_color_hex(fill), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(m.obj, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_color(m.obj, lv_color_hex(0x000000), LV_PART_MAIN);
+    lv_obj_set_style_border_width(m.obj, 2, LV_PART_MAIN);
+    lv_obj_set_style_radius(m.obj, wp.rally ? 4 : 2, LV_PART_MAIN);
     lv_obj_clear_flag(m.obj, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(m.obj, LV_OBJ_FLAG_SCROLLABLE);
     ++slot;
@@ -18017,9 +18589,7 @@ static void mapReloadVisibleTiles() {
         char path[48];
         snprintf(path, sizeof(path), "/tiles/%u/%ld/%ld.jpg", (unsigned)z, (long)tx, (long)ty);
         if (s_tiles_fs_ready && tileCacheExists(path)) { tileCacheRemove(path); ++n; }
-        const uint32_t k = tileFetchDedupKey((uint8_t)z, tx, ty);   // clear dedup so it re-queues
-        for (int i = 0; i < k_tile_fetch_dedup_size; ++i)
-          if (s_tile_fetch_dedup[i] == k) s_tile_fetch_dedup[i] = 0;
+        tileFetchForget((uint8_t)z, tx, ty);   // clear dedup so it re-queues
       }
     }
   }
@@ -18034,6 +18604,289 @@ static void mapReloadVisibleTiles() {
   renderMapTiles();      // misses on the just-deleted files → queues fresh fetches
   renderMapMarkers();
 }
+
+static int queueTileAreaToCurrentZoom() {
+  if (s_map_center_lat == 0.0 && s_map_center_lon == 0.0) return -1;
+  if (!s_tiles_fs_ready || !s_tile_fs) return -2;
+  if (WiFi.status() != WL_CONNECTED) return -3;
+
+  const uint8_t maxz = s_map_zoom;
+  double cwx, cwy;
+  latLonToWorldPx(s_map_center_lat, s_map_center_lon, maxz, &cwx, &cwy);
+  const double left_px   = cwx - (double)k_map_canvas_w / 2.0;
+  const double right_px  = cwx + (double)k_map_canvas_w / 2.0;
+  const double top_px    = cwy - (double)k_map_canvas_h / 2.0;
+  const double bottom_px = cwy + (double)k_map_canvas_h / 2.0;
+
+  int queued = 0;
+  for (int z = (int)maxz; z >= (int)k_map_zoom_min; --z) {
+    const int shift = (int)maxz - z;
+    const double scale = (double)(1u << shift);
+    const int32_t span = (int32_t)1 << z;
+    int32_t x0 = (int32_t)floor(left_px / (256.0 * scale));
+    int32_t x1 = (int32_t)floor((right_px - 1.0) / (256.0 * scale));
+    int32_t y0 = (int32_t)floor(top_px / (256.0 * scale));
+    int32_t y1 = (int32_t)floor((bottom_px - 1.0) / (256.0 * scale));
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 >= span) x1 = span - 1;
+    if (y1 >= span) y1 = span - 1;
+    for (int32_t ty = y0; ty <= y1; ++ty) {
+      for (int32_t tx = x0; tx <= x1; ++tx) {
+        const uint16_t pending0 = s_tile_fetch_pending;
+        queueTileForFetch((uint8_t)z, tx, ty);
+        if (s_tile_fetch_pending != pending0) ++queued;
+      }
+    }
+  }
+  return queued;
+}
+
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+static void refreshTileQueueManager() {
+  if (!s_tile_queue_list || !s_tile_queue_status) return;
+  lv_obj_clean(s_tile_queue_list);
+
+  int waiting = 0;
+  if (s_tile_fetch_queue) waiting = (int)uxQueueMessagesWaiting(s_tile_fetch_queue);
+
+  char top[192];
+#if defined(HAS_TDECK_GT911)
+  const char* backend = (s_tile_fs == &SD) ? "SD" : (s_tile_fs == &s_tiles_fs ? "flash" : "none");
+#else
+  const char* backend = (s_tile_fs == &s_tiles_fs) ? "flash" : "none";
+#endif
+  snprintf(top, sizeof top,
+           "Store %s  %s  Queue %d  Pending %u  OK %u  Fail %u  Last %s  HTTP %d",
+           backend,
+           s_tile_fetch_paused ? "paused" : "running",
+           waiting,
+           (unsigned)s_tile_fetch_pending,
+           (unsigned)s_tile_fetch_ok,
+           (unsigned)s_tile_fetch_failed,
+           tileFetchStateText(s_tile_fetch_last_wr),
+           (int)s_tile_fetch_last_code);
+  lv_label_set_text(s_tile_queue_status, top);
+
+  if (s_tile_queue_pause_btn) {
+    lv_obj_t* lbl = lv_obj_get_child(s_tile_queue_pause_btn, 0);
+    if (lbl) lv_label_set_text(lbl, s_tile_fetch_paused ? "Resume" : "Pause");
+    lv_obj_set_style_bg_color(s_tile_queue_pause_btn,
+                              lv_color_hex(s_tile_fetch_paused ? COLOR_STATUS_OK : COLOR_STATUS_WARN),
+                              LV_PART_MAIN);
+  }
+
+  const uint32_t now_ms = millis();
+  int rows = 0;
+  for (int n = 0; n < k_tile_fetch_ui_hist; ++n) {
+    const int idx = (int)((s_tile_fetch_ui_head + k_tile_fetch_ui_hist - 1 - n) % k_tile_fetch_ui_hist);
+    const TileFetchUiEntry& e = s_tile_fetch_ui[idx];
+    if (!e.used) continue;
+    ++rows;
+    lv_obj_t* btn = lv_btn_create(s_tile_queue_list);
+    lv_obj_set_width(btn, lv_pct(100));
+    lv_obj_set_height(btn, 52);
+    styleButton(btn);
+    char row[160];
+    const unsigned long age_s = e.stamp_ms ? (unsigned long)((now_ms - e.stamp_ms) / 1000UL) : 0;
+    if (e.http_code != 0) {
+      snprintf(row, sizeof row, "z%u  %ld/%ld\n%s  try %u  http %d  %lus",
+               (unsigned)e.z, (long)e.x, (long)e.y,
+               tileFetchStateText(e.state), (unsigned)e.tries, (int)e.http_code, age_s);
+    } else {
+      snprintf(row, sizeof row, "z%u  %ld/%ld\n%s  try %u  %lus",
+               (unsigned)e.z, (long)e.x, (long)e.y,
+               tileFetchStateText(e.state), (unsigned)e.tries, age_s);
+    }
+    lv_obj_t* lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, row);
+    lv_obj_set_style_text_font(lbl, &g_font_12, LV_PART_MAIN);
+    lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 6, 0);
+  }
+
+  if (rows == 0) {
+    lv_obj_t* lbl = lv_label_create(s_tile_queue_list);
+    lv_label_set_text(lbl, "No tile jobs yet.\nUse Area to queue the current map view.");
+    lv_obj_set_style_text_font(lbl, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  }
+}
+
+static void tileQueueTogglePauseCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  s_tile_fetch_paused = !s_tile_fetch_paused;
+  if (g_lv.task) g_lv.task->showAlert(s_tile_fetch_paused ? TR("Tile downloads paused") : TR("Tile downloads resumed"), 1400);
+  refreshTileQueueManager();
+}
+
+static void tileQueueRetryFailedCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  int retried = 0;
+  for (int i = 0; i < k_tile_fetch_ui_hist; ++i) {
+    TileFetchUiEntry& te = s_tile_fetch_ui[i];
+    if (!te.used) continue;
+    if (!tileFetchStateIsFailure(te.state)) continue;
+    tileFetchForget(te.z, te.x, te.y);
+    queueTileForFetch(te.z, te.x, te.y);
+    ++retried;
+  }
+  char msg[64];
+  snprintf(msg, sizeof msg, "Retry queued %d tile%s", retried, retried == 1 ? "" : "s");
+  g_lv.task->showAlert(msg, 1500);
+  refreshTileQueueManager();
+}
+
+static void tileQueueQueueAreaCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  const int queued = queueTileAreaToCurrentZoom();
+  if (queued > 0) {
+    char msg[72];
+    snprintf(msg, sizeof msg, "Queued %d tiles for this area", queued);
+    g_lv.task->showAlert(msg, 1600);
+  } else if (queued == 0) {
+    g_lv.task->showAlert(TR("No new tiles queued"), 1600);
+  } else if (queued == -1) {
+    g_lv.task->showAlert(TR("Set your location first"), 1800);
+  } else if (queued == -2) {
+    g_lv.task->showAlert(TR("No tile cache available"), 1800);
+  } else {
+    g_lv.task->showAlert(TR("Connect Wi-Fi to pre-load tiles"), 1800);
+  }
+  refreshTileQueueManager();
+}
+
+static void tileQueueClearDoneCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  for (int i = 0; i < k_tile_fetch_ui_hist; ++i) {
+    TileFetchUiEntry& te = s_tile_fetch_ui[i];
+    if (tileFetchStateIsDone(te.state)) {
+      te = TileFetchUiEntry{};
+    }
+  }
+  refreshTileQueueManager();
+}
+
+static void openTileQueueManager() {
+  lv_obj_t* body = openFullscreenView("Tile queue");
+  s_tile_queue_body = body;
+  lv_obj_set_style_pad_all(body, 6, LV_PART_MAIN);
+
+  lv_obj_t* row = lv_obj_create(body);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, lv_pct(100), 36);
+  lv_obj_set_pos(row, 0, 0);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+  auto mk = [&](const char* txt, int x, int w, lv_event_cb_t cb, uint32_t bg = COLOR_PANEL) {
+    lv_obj_t* b = lv_btn_create(row);
+    lv_obj_set_size(b, w, 32);
+    lv_obj_set_pos(b, x, 0);
+    styleButton(b);
+    lv_obj_set_style_bg_color(b, lv_color_hex(bg), LV_PART_MAIN);
+    lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* l = lv_label_create(b);
+    lv_label_set_text(l, txt);
+    lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
+    lv_obj_center(l);
+    return b;
+  };
+  s_tile_queue_pause_btn = mk(s_tile_fetch_paused ? "Resume" : "Pause", 0, 54, tileQueueTogglePauseCb,
+                              s_tile_fetch_paused ? COLOR_STATUS_OK : COLOR_STATUS_WARN);
+  mk("Retry", 58, 48, tileQueueRetryFailedCb, 0x2E6D91);
+  mk("Area", 110, 44, tileQueueQueueAreaCb, 0x2F5B84);
+  mk("Clear", 158, 46, tileQueueClearDoneCb, 0x7A2E2E);
+
+  s_tile_queue_status = lv_label_create(body);
+  lv_obj_set_width(s_tile_queue_status, lv_pct(100));
+  lv_obj_set_pos(s_tile_queue_status, 0, 42);
+  lv_obj_set_style_text_font(s_tile_queue_status, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_tile_queue_status, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+
+  s_tile_queue_list = lv_list_create(body);
+  lv_obj_set_size(s_tile_queue_list, lv_pct(100),
+                  LV_MAX((lv_coord_t)80, (lv_coord_t)(lv_disp_get_ver_res(nullptr) - STATUSBAR_H - 88)));
+  lv_obj_set_pos(s_tile_queue_list, 0, 74);
+  lv_obj_set_style_bg_color(s_tile_queue_list, lv_color_hex(COLOR_BG), LV_PART_MAIN);
+  lv_obj_set_style_border_width(s_tile_queue_list, 0, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(s_tile_queue_list, 0, LV_PART_MAIN);
+  refreshTileQueueManager();
+}
+#endif
+
+static bool tileNameHasRasterExt(const char* name) {
+  if (!name) return false;
+  const char* dot = strrchr(name, '.');
+  if (!dot) return false;
+  return !strcasecmp(dot, ".jpg") || !strcasecmp(dot, ".png");
+}
+
+static int clearTileCacheTree() {
+  if (!s_tiles_fs_ready || !s_tile_fs) return -1;
+  File root = tileCacheOpen("/tiles", "r");
+  if (!root || !root.isDirectory()) {
+    if (root) root.close();
+    return 0;
+  }
+
+  int removed = 0;
+  File zent = root.openNextFile();
+  while (zent) {
+    if (zent.isDirectory()) {
+      const char* zfull = zent.name();
+      const char* zbase = strrchr(zfull, '/');
+      zbase = zbase ? zbase + 1 : zfull;
+      char zpath[24];
+      snprintf(zpath, sizeof zpath, "/tiles/%s", zbase);
+      File xdir = tileCacheOpen(zpath, "r");
+      if (xdir && xdir.isDirectory()) {
+        File xent = xdir.openNextFile();
+        while (xent) {
+          if (xent.isDirectory()) {
+            const char* xfull = xent.name();
+            const char* xbase = strrchr(xfull, '/');
+            xbase = xbase ? xbase + 1 : xfull;
+            char xpath[40];
+            snprintf(xpath, sizeof xpath, "%s/%s", zpath, xbase);
+            File fdir = tileCacheOpen(xpath, "r");
+            if (fdir && fdir.isDirectory()) {
+              File fent = fdir.openNextFile();
+              while (fent) {
+                if (!fent.isDirectory()) {
+                  const char* nfull = fent.name();
+                  const char* nbase = strrchr(nfull, '/');
+                  nbase = nbase ? nbase + 1 : nfull;
+                  if (tileNameHasRasterExt(nbase)) {
+                    char fpath[56];
+                    snprintf(fpath, sizeof fpath, "%s/%s", xpath, nbase);
+                    if (tileCacheExists(fpath)) {
+                      tileCacheRemove(fpath);
+                      ++removed;
+                    }
+                  }
+                }
+                fent.close();
+                fent = fdir.openNextFile();
+              }
+            }
+            if (fdir) fdir.close();
+            tileCacheRmdir(xpath);
+          }
+          xent.close();
+          xent = xdir.openNextFile();
+        }
+      }
+      if (xdir) xdir.close();
+      tileCacheRmdir(zpath);
+    }
+    zent.close();
+    zent = root.openNextFile();
+  }
+  root.close();
+  tileCacheRmdir("/tiles");
+  memset(s_tile_fetch_dedup, 0, sizeof s_tile_fetch_dedup);
+  s_tile_fetch_dedup_head = 0;
+  return removed;
+}
 #endif
 
 static void mapOptReloadCb(lv_event_t* e) {
@@ -18044,6 +18897,78 @@ static void mapOptReloadCb(lv_event_t* e) {
 #else
   if (g_lv.task) g_lv.task->showAlert(TR("Tile reload needs Wi-Fi build"), 1800);
 #endif
+}
+
+static void mapOptCacheAreaCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  closeMapOptions();
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+  const int queued = queueTileAreaToCurrentZoom();
+  if (!g_lv.task) return;
+  if (queued >= 0) {
+    char msg[72];
+    snprintf(msg, sizeof msg, "Queued %d tiles (z%u to z%u)", queued,
+             (unsigned)s_map_zoom, (unsigned)k_map_zoom_min);
+    g_lv.task->showAlert(msg, 2200);
+  } else if (queued == -1) {
+    g_lv.task->showAlert(TR("Set your location first"), 1600);
+  } else if (queued == -2) {
+    g_lv.task->showAlert(TR("No tile cache available"), 1800);
+  } else {
+    g_lv.task->showAlert(TR("Connect Wi-Fi to pre-load tiles"), 1800);
+  }
+#else
+  if (g_lv.task) g_lv.task->showAlert(TR("Tile pre-load needs Wi-Fi build"), 1800);
+#endif
+}
+
+static void mapOptClearCacheCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  closeMapOptions();
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+  freeMapTiles();
+  const int removed = clearTileCacheTree();
+  renderMapTiles();
+  renderMapMarkers();
+  if (!g_lv.task) return;
+  if (removed >= 0) {
+    char msg[56];
+    snprintf(msg, sizeof msg, "Cleared %d cached tiles", removed);
+    g_lv.task->showAlert(msg, 2000);
+  } else {
+    g_lv.task->showAlert(TR("No tile cache available"), 1800);
+  }
+#else
+  if (g_lv.task) g_lv.task->showAlert(TR("Tile cache clear needs Wi-Fi build"), 1800);
+#endif
+}
+
+static void mapOptWaypointsCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  closeMapOptions();
+  openWaypointManager();
+}
+
+static void mapOptTileQueueCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  closeMapOptions();
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+  openTileQueueManager();
+#else
+  if (g_lv.task) g_lv.task->showAlert(TR("Tile queue needs Wi-Fi build"), 1800);
+#endif
+}
+
+static void mapOptSetRallyCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  closeMapOptions();
+  if (addWaypointAt(g_lv.task->getNodeLat(), g_lv.task->getNodeLon(), true, "Rally point", "Return / breadcrumb")) {
+    renderMapMarkers();
+    refreshMapInfoLabel();
+    g_lv.task->showAlert(TR("Rally point saved"), 1500);
+  } else {
+    g_lv.task->showAlert(TR("No GPS fix for rally point"), 1800);
+  }
 }
 
 // Map info / credits sheet — OSM attribution (policy requirement) plus a short
@@ -18180,6 +19105,110 @@ static void openMapOptions() {
     lv_obj_add_event_cb(sw_zoom, mapOptZoomButtonsCb, LV_EVENT_VALUE_CHANGED, nullptr);
     y += 40;
   }
+
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+  {
+    lv_obj_t* btn = lv_btn_create(card);
+    lv_obj_set_size(btn, lv_pct(100), SC(36));
+    lv_obj_set_pos(btn, 0, y);
+    styleButton(btn);
+    lv_obj_add_event_cb(btn, mapOptWaypointsCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* bl = lv_label_create(btn);
+    lv_label_set_text(bl, TR("Waypoints and tracks"));
+    lv_obj_set_style_text_font(bl, &g_font_14, LV_PART_MAIN);
+    lv_obj_center(bl);
+    y += 44;
+  }
+
+  {
+    lv_obj_t* btn = lv_btn_create(card);
+    lv_obj_set_size(btn, lv_pct(100), SC(36));
+    lv_obj_set_pos(btn, 0, y);
+    styleButton(btn);
+    lv_obj_add_event_cb(btn, mapOptTileQueueCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* bl = lv_label_create(btn);
+    lv_label_set_text(bl, TR("Download queue"));
+    lv_obj_set_style_text_font(bl, &g_font_14, LV_PART_MAIN);
+    lv_obj_center(bl);
+    y += 44;
+  }
+
+  {
+    lv_obj_t* btn = lv_btn_create(card);
+    lv_obj_set_size(btn, lv_pct(100), SC(36));
+    lv_obj_set_pos(btn, 0, y);
+    styleButton(btn);
+    lv_obj_add_event_cb(btn, mapOptSetRallyCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* bl = lv_label_create(btn);
+    lv_label_set_text(bl, TR("Mark rally point here"));
+    lv_obj_set_style_text_font(bl, &g_font_14, LV_PART_MAIN);
+    lv_obj_center(bl);
+    y += 44;
+  }
+
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+  {
+    lv_obj_t* btn = lv_btn_create(card);
+    lv_obj_set_size(btn, lv_pct(100), SC(36));
+    lv_obj_set_pos(btn, 0, y);
+    styleButton(btn);
+    lv_obj_add_event_cb(btn, mapOptCacheAreaCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* bl = lv_label_create(btn);
+    lv_label_set_text(bl, TR("Pre-load area to current zoom"));
+    lv_obj_set_style_text_font(bl, &g_font_14, LV_PART_MAIN);
+    lv_obj_center(bl);
+    y += 44;
+  }
+
+  {
+    lv_obj_t* btn = lv_btn_create(card);
+    lv_obj_set_size(btn, lv_pct(100), SC(36));
+    lv_obj_set_pos(btn, 0, y);
+    styleButton(btn);
+    lv_obj_add_event_cb(btn, mapOptClearCacheCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* bl = lv_label_create(btn);
+    lv_label_set_text(bl, TR("Clear tile cache"));
+    lv_obj_set_style_text_font(bl, &g_font_14, LV_PART_MAIN);
+    lv_obj_center(bl);
+    y += 44;
+  }
+
+  {
+    auto fmt_mb = [](size_t bytes, char* out, size_t cap) {
+      if (!out || cap == 0) return;
+      if (bytes >= 1024u * 1024u) snprintf(out, cap, "%.1f MB", (double)bytes / (1024.0 * 1024.0));
+      else                        snprintf(out, cap, "%lu KB", (unsigned long)(bytes / 1024u));
+    };
+    char a[24] = "";
+    char b[24] = "";
+    char cache[160];
+    if (s_tile_fs == &s_tiles_fs && s_tiles_fs_ready) {
+      const size_t used = s_tiles_fs.usedBytes();
+      const size_t total = s_tiles_fs.totalBytes();
+      fmt_mb(used, a, sizeof a);
+      fmt_mb(total, b, sizeof b);
+      snprintf(cache, sizeof cache, "Cache local %s / %s  Queue %u  Gaps %d%s",
+               a, b, (unsigned)s_tile_fetch_pending, s_map_last_missing,
+               tilesFsLowSpace() ? "  low space" : "");
+#if defined(HAS_TDECK_GT911)
+    } else if (s_tile_fs == &SD) {
+      snprintf(cache, sizeof cache, "Cache on SD  Queue %u  Gaps %d",
+               (unsigned)s_tile_fetch_pending, s_map_last_missing);
+#endif
+    } else {
+      snprintf(cache, sizeof cache, "Cache unavailable  Queue %u  Gaps %d",
+               (unsigned)s_tile_fetch_pending, s_map_last_missing);
+    }
+    lv_obj_t* info = lv_label_create(card);
+    lv_obj_set_width(info, cardw - 24);
+    lv_label_set_long_mode(info, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(info, cache);
+    lv_obj_set_style_text_color(info, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_set_style_text_font(info, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_pos(info, 2, y);
+    y += 34;
+  }
+#endif
 
   // ---- Section separator + label: the on-map visibility toggles below are a
   //      distinct, lower-stakes group from the tile settings above.
@@ -18737,12 +19766,26 @@ static void mapCanvasEventCb(lv_event_t* e) {
       const int ddy = my - p.y;
       if (ddx * ddx + ddy * ddy <= R2) {
         if (n_hits < k_map_markers_max) hits[n_hits++] = m.mesh_idx;
+        if (n_hits <= k_map_markers_max) hits[n_hits - 1] = (int)(&m - &s_map_markers[0]);
       }
     }
     if (n_hits == 1) {
-      openMarkerPopupForContact(hits[0]);
+      handleMapMarkerHit(hits[0]);
     } else if (n_hits > 1) {
-      openMapPicker(hits, n_hits);
+      bool contacts_only = true;
+      for (int i = 0; i < n_hits; ++i) {
+        if (hits[i] < 0 || hits[i] >= k_map_markers_max || s_map_markers[hits[i]].kind != 2) {
+          contacts_only = false;
+          break;
+        }
+      }
+      if (contacts_only) {
+        int mesh_hits[k_map_markers_max];
+        for (int i = 0; i < n_hits; ++i) mesh_hits[i] = s_map_markers[hits[i]].mesh_idx;
+        openMapPicker(mesh_hits, n_hits);
+      } else {
+        handleMapMarkerHit(hits[0]);
+      }
     }
     return;
   }
@@ -19250,10 +20293,24 @@ static void refreshMapInfoLabel() {
   //   • tiles queued/downloading  -> "downloading N"
   //   • gaps but Wi-Fi is down     -> "Wi-Fi off"
   // Otherwise show the usual marker count.
-  char tail[28];
+  char tail[64];
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
   const bool wifi_up = (WiFi.status() == WL_CONNECTED);
-  if (s_tile_fetch_pending > 0) {
+  if (s_nav_target_wp >= 0 && s_nav_target_wp < k_local_waypoints_max && s_waypoints[s_nav_target_wp].used &&
+      !(lat == 0.0 && lon == 0.0)) {
+    const LocalWaypoint& wp = s_waypoints[s_nav_target_wp];
+    const double km = contactDistanceKm(lat, lon, (double)wp.lat_e6 / 1.0e6, (double)wp.lon_e6 / 1.0e6);
+    const double brg = bearingDegrees(lat, lon, (double)wp.lat_e6 / 1.0e6, (double)wp.lon_e6 / 1.0e6);
+    if (km < 1.0) snprintf(tail, sizeof tail, "%s %dm %s",
+                           wp.rally ? "RP" : "WP",
+                           (int)(km * 1000.0 + 0.5), bearingCardinal(brg));
+    else          snprintf(tail, sizeof tail, "%s %.1fkm %s",
+                           wp.rally ? "RP" : "WP",
+                           km, bearingCardinal(brg));
+  } else if (s_track_recording) {
+    snprintf(tail, sizeof tail, "REC %.1fkm  %lu pt",
+             (double)s_track_total_km, (unsigned long)s_track_point_count);
+  } else if (s_tile_fetch_pending > 0) {
     snprintf(tail, sizeof(tail), "\xe2\x86\x93 %u downloading",
              (unsigned)s_tile_fetch_pending);
   } else if (s_map_last_missing > 0 && !wifi_up) {
@@ -19262,7 +20319,23 @@ static void refreshMapInfoLabel() {
     snprintf(tail, sizeof(tail), TR("%d on map"), with_gps);
   }
 #else
-  snprintf(tail, sizeof(tail), TR("%d on map"), with_gps);
+  if (s_nav_target_wp >= 0 && s_nav_target_wp < k_local_waypoints_max && s_waypoints[s_nav_target_wp].used &&
+      !(lat == 0.0 && lon == 0.0)) {
+    const LocalWaypoint& wp = s_waypoints[s_nav_target_wp];
+    const double km = contactDistanceKm(lat, lon, (double)wp.lat_e6 / 1.0e6, (double)wp.lon_e6 / 1.0e6);
+    const double brg = bearingDegrees(lat, lon, (double)wp.lat_e6 / 1.0e6, (double)wp.lon_e6 / 1.0e6);
+    if (km < 1.0) snprintf(tail, sizeof tail, "%s %dm %s",
+                           wp.rally ? "RP" : "WP",
+                           (int)(km * 1000.0 + 0.5), bearingCardinal(brg));
+    else          snprintf(tail, sizeof tail, "%s %.1fkm %s",
+                           wp.rally ? "RP" : "WP",
+                           km, bearingCardinal(brg));
+  } else if (s_track_recording) {
+    snprintf(tail, sizeof tail, "REC %.1fkm  %lu pt",
+             (double)s_track_total_km, (unsigned long)s_track_point_count);
+  } else {
+    snprintf(tail, sizeof(tail), TR("%d on map"), with_gps);
+  }
 #endif
   // Coords → bottom-left corner; count/status → bottom-right corner.
   char buf[40];
@@ -21200,6 +22273,24 @@ static double contactDistanceKm(double lat1, double lon1,
                    cos(lat1 * M_PI / 180.0) * cos(lat2 * M_PI / 180.0) *
                    sin(dlon / 2) * sin(dlon / 2);
   return R * 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
+}
+
+static double bearingDegrees(double lat1, double lon1, double lat2, double lon2) {
+  const double p1 = lat1 * M_PI / 180.0;
+  const double p2 = lat2 * M_PI / 180.0;
+  const double dl = (lon2 - lon1) * M_PI / 180.0;
+  const double y = sin(dl) * cos(p2);
+  const double x = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl);
+  double deg = atan2(y, x) * 180.0 / M_PI;
+  while (deg < 0.0) deg += 360.0;
+  while (deg >= 360.0) deg -= 360.0;
+  return deg;
+}
+
+static const char* bearingCardinal(double deg) {
+  static const char* k_dirs[8] = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
+  const int idx = (int)floor((deg + 22.5) / 45.0) & 7;
+  return k_dirs[idx];
 }
 
 // Format a compact distance badge, honouring the km/miles preference:
@@ -23388,6 +24479,12 @@ static void ccThemeCb(lv_event_t* e) {
   closeControlCenter();
   openAccentPicker();
 }
+// Screen-rotation chip: cycles Portrait -> Landscape -> Landscape(flipped) and reboots.
+static void ccRotateCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  closeControlCenter();
+  rotateScreenCycleCb(nullptr);
+}
 
 #if defined(HAS_TDECK_KEYBOARD)
 static void ccKbBacklightCb(lv_event_t* e) {
@@ -23840,16 +24937,17 @@ static void openControlCenter() {
 #if defined(HAS_TDECK_GT911)
   tw = 58; th = 36;
 #else
-  tw = (card_w - 20 - 4 * 5) / 5;   // 5 chips (Wi-Fi/BT/GPS/Theme/Sound) + 4 gaps
-  if (tw > 76) tw = 76;
+  tw = (card_w - 20 - 5 * 5) / 6;   // 6 chips (Wi-Fi/BT/GPS/Theme/Rotate/Sound) + 5 gaps
+  if (tw > 66) tw = 66;
 #endif
-  // Each chip: tap = toggle, long-press = jump to that feature's settings page
-  // (GPS -> Radio & Mesh, where the location-sharing settings live).
+  // Each chip: tap = toggle/action, long-press = jump to that feature's settings page.
+  const bool is_landscape = (touchPrefsGetUiRotation() != LV_DISP_ROT_NONE);
   ccToggle(row, LV_SYMBOL_WIFI, "Wi-Fi", wifi_on, ccWifiCb, tw, th, CAT_WIFI);
   if (!g_lv.task || g_lv.task->hasBleCapability())
     ccToggle(row, LV_SYMBOL_BLUETOOTH, "BT", ble_on, ccBleCb, tw, th, CAT_BLUETOOTH);
   ccToggle(row, LV_SYMBOL_GPS, "GPS", gps_on, ccGpsCb, tw, th, CAT_RADIO);
   ccToggle(row, LV_SYMBOL_TINT, "Theme", false, ccThemeCb, tw, th, CAT_DISPLAY);
+  ccToggle(row, LV_SYMBOL_LOOP, is_landscape ? "Landscape" : "Portrait", is_landscape, ccRotateCb, tw, th, CAT_DISPLAY);
 #if defined(HAS_TDECK_KEYBOARD)
   ccToggle(row, LV_SYMBOL_KEYBOARD,
            s_kb_bl_mode == 0 ? "off" : (s_kb_bl_mode == 1 ? "on" : "auto"),
@@ -25122,13 +26220,72 @@ static inline void setLabelIfChanged(lv_obj_t* lbl, const char* txt) {
   if (lbl && strcmp(lv_label_get_text(lbl), txt) != 0) lv_label_set_text(lbl, txt);
 }
 
-static void localEnvHistoryShiftPush(uint16_t batt_mv, int16_t temp_t10, int16_t hum_pct) {
+static void localEnvHistoryShiftPush(uint16_t batt_mv, int16_t temp_t10, int16_t hum_pct,
+                                     int16_t press_hpa10, int16_t alt_m) {
   memmove(&s_home_env_hist_batt_mv[0], &s_home_env_hist_batt_mv[1], sizeof(s_home_env_hist_batt_mv[0]) * (kHomeEnvHistoryPoints - 1));
   memmove(&s_home_env_hist_temp_t10[0], &s_home_env_hist_temp_t10[1], sizeof(s_home_env_hist_temp_t10[0]) * (kHomeEnvHistoryPoints - 1));
   memmove(&s_home_env_hist_hum[0], &s_home_env_hist_hum[1], sizeof(s_home_env_hist_hum[0]) * (kHomeEnvHistoryPoints - 1));
+  memmove(&s_home_env_hist_press_hpa10[0], &s_home_env_hist_press_hpa10[1], sizeof(s_home_env_hist_press_hpa10[0]) * (kHomeEnvHistoryPoints - 1));
+  memmove(&s_home_env_hist_alt_m[0], &s_home_env_hist_alt_m[1], sizeof(s_home_env_hist_alt_m[0]) * (kHomeEnvHistoryPoints - 1));
   s_home_env_hist_batt_mv[kHomeEnvHistoryPoints - 1] = batt_mv;
   s_home_env_hist_temp_t10[kHomeEnvHistoryPoints - 1] = temp_t10;
   s_home_env_hist_hum[kHomeEnvHistoryPoints - 1] = hum_pct;
+  s_home_env_hist_press_hpa10[kHomeEnvHistoryPoints - 1] = press_hpa10;
+  s_home_env_hist_alt_m[kHomeEnvHistoryPoints - 1] = alt_m;
+}
+
+static void pressureAlarmHistoryShiftPush(uint32_t now_ms, int16_t press_hpa10) {
+  memmove(&s_press_alarm_hist_hpa10[0], &s_press_alarm_hist_hpa10[1],
+          sizeof(s_press_alarm_hist_hpa10[0]) * (kPressureAlarmHistoryPoints - 1));
+  memmove(&s_press_alarm_hist_ms[0], &s_press_alarm_hist_ms[1],
+          sizeof(s_press_alarm_hist_ms[0]) * (kPressureAlarmHistoryPoints - 1));
+  s_press_alarm_hist_hpa10[kPressureAlarmHistoryPoints - 1] = press_hpa10;
+  s_press_alarm_hist_ms[kPressureAlarmHistoryPoints - 1] = now_ms;
+}
+
+static void localPressureAlarmMaybeCheck(unsigned long now_ms, int16_t press_hpa10, int16_t hum_pct) {
+  if (press_hpa10 <= 0) return;
+  if (!s_press_alarm_seeded) {
+    for (int i = 0; i < kPressureAlarmHistoryPoints; ++i) {
+      s_press_alarm_hist_hpa10[i] = press_hpa10;
+      s_press_alarm_hist_ms[i] = (uint32_t)now_ms;
+    }
+    s_press_alarm_seeded = true;
+    return;
+  }
+
+  pressureAlarmHistoryShiftPush((uint32_t)now_ms, press_hpa10);
+
+  int idx = -1;
+  for (int i = 0; i < kPressureAlarmHistoryPoints; ++i) {
+    if (s_press_alarm_hist_hpa10[i] <= 0 || s_press_alarm_hist_ms[i] == 0) continue;
+    const uint32_t age = (uint32_t)(now_ms - s_press_alarm_hist_ms[i]);
+    if (age >= kPressureAlarmMinAgeMs && age <= kPressureAlarmWindowMs) { idx = i; break; }
+  }
+  if (idx < 0) return;
+
+  const int16_t drop = (int16_t)(s_press_alarm_hist_hpa10[idx] - press_hpa10);
+  const uint32_t age_ms = (uint32_t)(now_ms - s_press_alarm_hist_ms[idx]);
+  s_pressure_alarm_last_drop_hpa10 = drop > 0 ? drop : 0;
+  s_pressure_alarm_last_window_min = (uint16_t)(age_ms / 60000UL);
+
+  if (drop < kPressureAlarmDropHpa10 / 2) s_pressure_alarm_active = false;
+  if (drop < kPressureAlarmDropHpa10) return;
+  if (s_pressure_alarm_active) return;
+  if (s_pressure_alarm_last_ms != 0 &&
+      (uint32_t)(now_ms - s_pressure_alarm_last_ms) < kPressureAlarmCooldownMs) return;
+
+  if (!touchPrefsGetWeatherAlarm()) return;
+  s_pressure_alarm_active = true;
+  s_pressure_alarm_last_ms = now_ms;
+  if (g_lv.task) {
+    char msg[112];
+    snprintf(msg, sizeof msg, "Pressure drop %.1f hPa / %u min%s",
+             (double)drop / 10.0, (unsigned)s_pressure_alarm_last_window_min,
+             hum_pct >= 85 ? "  high humidity" : "");
+    g_lv.task->showAlert(msg, 3200);
+    if (touchPrefsGetWeatherAlarmSound() && !g_lv.task->isBuzzerQuiet()) uiPlayMention();
+  }
 }
 
 static void localEnvHistoryMaybeSample(unsigned long now_ms) {
@@ -25142,18 +26299,23 @@ static void localEnvHistoryMaybeSample(unsigned long now_ms) {
                         : (snap.have_gxhtv3_temp ? (int16_t)lroundf(snap.gxhtv3_temp_c * 10.0f) : INT16_MIN);
   const int16_t hum_pct = snap.have_bme_hum ? (int16_t)lroundf(snap.bme_hum_pct)
                        : (snap.have_gxhtv3_hum ? (int16_t)lroundf(snap.gxhtv3_hum_pct) : -1);
+  const int16_t press_hpa10 = snap.have_bme_pressure ? (int16_t)lroundf(snap.bme_pressure_hpa * 10.0f) : INT16_MIN;
+  const int16_t alt_m = snap.have_bme_alt ? snap.bme_alt_m : INT16_MIN;
 
   if (!s_home_env_hist_seeded) {
     for (int i = 0; i < kHomeEnvHistoryPoints; ++i) {
       s_home_env_hist_batt_mv[i] = batt_mv;
       s_home_env_hist_temp_t10[i] = temp_t10;
       s_home_env_hist_hum[i] = hum_pct;
+      s_home_env_hist_press_hpa10[i] = press_hpa10;
+      s_home_env_hist_alt_m[i] = alt_m;
     }
     s_home_env_hist_seeded = true;
   } else {
-    localEnvHistoryShiftPush(batt_mv, temp_t10, hum_pct);
+    localEnvHistoryShiftPush(batt_mv, temp_t10, hum_pct, press_hpa10, alt_m);
   }
   s_home_env_last_sample_ms = now_ms;
+  if (press_hpa10 != INT16_MIN) localPressureAlarmMaybeCheck(now_ms, press_hpa10, hum_pct);
 
   if (s_home_env_chart && s_home_env_batt && s_home_env_temp && s_home_env_hum) {
     lv_chart_set_next_value(s_home_env_chart, s_home_env_batt, batt_mv > 0 ? (lv_coord_t)batt_mv : LV_CHART_POINT_NONE);
@@ -25262,6 +26424,9 @@ static void refreshStatusLabels() {
     }
   }
   if (active_tab == SENSORS_TAB_INDEX) refreshSensorsTab();
+#if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION)
+  if (s_tile_queue_status) refreshTileQueueManager();
+#endif
   const bool settings_active = (active_tab == SETTINGS_TAB_INDEX);
   // Map tab: refresh the bottom info strip (self GPS + on-map count) only
   // when the tab is actually visible. Cheap, but no point doing it on every
@@ -26410,6 +27575,134 @@ static lv_obj_t* s_sens_atmo_lbl  = nullptr;  // Temp / Hum / Press / Alt block
 static lv_obj_t* s_sens_gps_lbl   = nullptr;  // GPS block
 static lv_obj_t* s_sens_batt_lbl  = nullptr;  // Battery block
 static lv_obj_t* s_sens_time_lbl  = nullptr;  // "Updated HH:MM:SS" footer
+static lv_obj_t* s_sens_env_chart = nullptr;
+static lv_chart_series_t* s_sens_env_temp = nullptr;
+static lv_chart_series_t* s_sens_env_hum  = nullptr;
+static lv_obj_t* s_sens_env_legend = nullptr;
+static lv_obj_t* s_sens_press_chart = nullptr;
+static lv_chart_series_t* s_sens_press_ser = nullptr;
+static lv_chart_series_t* s_sens_alt_ser = nullptr;
+static lv_obj_t* s_sens_press_legend = nullptr;
+static lv_obj_t* s_sens_batt_chart = nullptr;
+static lv_chart_series_t* s_sens_batt_ser = nullptr;
+static lv_obj_t* s_sens_batt_legend = nullptr;
+static lv_obj_t* s_sens_alerts_lbl = nullptr;
+
+static void refreshSensorsHistoryCharts() {
+  bool have_temp = false, have_hum = false, have_press = false, have_alt = false, have_batt = false;
+  int press_min = INT_MAX, press_max = INT_MIN;
+  int alt_min = INT_MAX, alt_max = INT_MIN;
+  for (int i = 0; i < kHomeEnvHistoryPoints; ++i) {
+    if (s_home_env_hist_temp_t10[i] != INT16_MIN) have_temp = true;
+    if (s_home_env_hist_hum[i] >= 0) have_hum = true;
+    if (s_home_env_hist_press_hpa10[i] != INT16_MIN) {
+      have_press = true;
+      const int v = s_home_env_hist_press_hpa10[i] / 10;
+      if (v < press_min) press_min = v;
+      if (v > press_max) press_max = v;
+    }
+    if (s_home_env_hist_alt_m[i] != INT16_MIN) {
+      have_alt = true;
+      const int v = s_home_env_hist_alt_m[i];
+      if (v < alt_min) alt_min = v;
+      if (v > alt_max) alt_max = v;
+    }
+    if (s_home_env_hist_batt_mv[i] > 0) have_batt = true;
+  }
+
+  if (s_sens_env_chart && s_sens_env_temp && s_sens_env_hum) {
+    const bool show = have_temp || have_hum;
+    if (show) {
+      lv_obj_clear_flag(s_sens_env_chart, LV_OBJ_FLAG_HIDDEN);
+      if (s_sens_env_legend) lv_obj_clear_flag(s_sens_env_legend, LV_OBJ_FLAG_HIDDEN);
+      lv_chart_set_all_value(s_sens_env_chart, s_sens_env_temp, LV_CHART_POINT_NONE);
+      lv_chart_set_all_value(s_sens_env_chart, s_sens_env_hum,  LV_CHART_POINT_NONE);
+      for (int i = 0; i < kHomeEnvHistoryPoints; ++i) {
+        lv_chart_set_next_value(s_sens_env_chart, s_sens_env_temp,
+                                s_home_env_hist_temp_t10[i] != INT16_MIN
+                                  ? (lv_coord_t)(s_home_env_hist_temp_t10[i] / 10)
+                                  : LV_CHART_POINT_NONE);
+        lv_chart_set_next_value(s_sens_env_chart, s_sens_env_hum,
+                                s_home_env_hist_hum[i] >= 0
+                                  ? (lv_coord_t)s_home_env_hist_hum[i]
+                                  : LV_CHART_POINT_NONE);
+      }
+      lv_chart_refresh(s_sens_env_chart);
+    } else {
+      lv_obj_add_flag(s_sens_env_chart, LV_OBJ_FLAG_HIDDEN);
+      if (s_sens_env_legend) lv_obj_add_flag(s_sens_env_legend, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  if (s_sens_press_chart && s_sens_press_ser && s_sens_alt_ser) {
+    const bool show = have_press || have_alt;
+    if (show) {
+      lv_obj_clear_flag(s_sens_press_chart, LV_OBJ_FLAG_HIDDEN);
+      if (s_sens_press_legend) lv_obj_clear_flag(s_sens_press_legend, LV_OBJ_FLAG_HIDDEN);
+      if (have_press) {
+        int lo = press_min - 3;
+        int hi = press_max + 3;
+        if (hi - lo < 12) {
+          const int mid = (press_min + press_max) / 2;
+          lo = mid - 6;
+          hi = mid + 6;
+        }
+        if (lo < 300) lo = 300;
+        if (hi > 1200) hi = 1200;
+        lv_chart_set_range(s_sens_press_chart, LV_CHART_AXIS_PRIMARY_Y, lo, hi);
+      } else {
+        lv_chart_set_range(s_sens_press_chart, LV_CHART_AXIS_PRIMARY_Y, 700, 1100);
+      }
+      if (have_alt) {
+        int lo = alt_min - 20;
+        int hi = alt_max + 20;
+        if (hi - lo < 80) {
+          const int mid = (alt_min + alt_max) / 2;
+          lo = mid - 40;
+          hi = mid + 40;
+        }
+        if (lo < -500) lo = -500;
+        if (hi > 9000) hi = 9000;
+        lv_chart_set_range(s_sens_press_chart, LV_CHART_AXIS_SECONDARY_Y, lo, hi);
+      } else {
+        lv_chart_set_range(s_sens_press_chart, LV_CHART_AXIS_SECONDARY_Y, 0, 4000);
+      }
+      lv_chart_set_all_value(s_sens_press_chart, s_sens_press_ser, LV_CHART_POINT_NONE);
+      lv_chart_set_all_value(s_sens_press_chart, s_sens_alt_ser, LV_CHART_POINT_NONE);
+      for (int i = 0; i < kHomeEnvHistoryPoints; ++i) {
+        lv_chart_set_next_value(s_sens_press_chart, s_sens_press_ser,
+                                s_home_env_hist_press_hpa10[i] != INT16_MIN
+                                  ? (lv_coord_t)(s_home_env_hist_press_hpa10[i] / 10)
+                                  : LV_CHART_POINT_NONE);
+        lv_chart_set_next_value(s_sens_press_chart, s_sens_alt_ser,
+                                s_home_env_hist_alt_m[i] != INT16_MIN
+                                  ? (lv_coord_t)s_home_env_hist_alt_m[i]
+                                  : LV_CHART_POINT_NONE);
+      }
+      lv_chart_refresh(s_sens_press_chart);
+    } else {
+      lv_obj_add_flag(s_sens_press_chart, LV_OBJ_FLAG_HIDDEN);
+      if (s_sens_press_legend) lv_obj_add_flag(s_sens_press_legend, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+
+  if (s_sens_batt_chart && s_sens_batt_ser) {
+    if (have_batt) {
+      lv_obj_clear_flag(s_sens_batt_chart, LV_OBJ_FLAG_HIDDEN);
+      if (s_sens_batt_legend) lv_obj_clear_flag(s_sens_batt_legend, LV_OBJ_FLAG_HIDDEN);
+      lv_chart_set_all_value(s_sens_batt_chart, s_sens_batt_ser, LV_CHART_POINT_NONE);
+      for (int i = 0; i < kHomeEnvHistoryPoints; ++i)
+        lv_chart_set_next_value(s_sens_batt_chart, s_sens_batt_ser,
+                                s_home_env_hist_batt_mv[i] > 0
+                                  ? (lv_coord_t)s_home_env_hist_batt_mv[i]
+                                  : LV_CHART_POINT_NONE);
+      lv_chart_refresh(s_sens_batt_chart);
+    } else {
+      lv_obj_add_flag(s_sens_batt_chart, LV_OBJ_FLAG_HIDDEN);
+      if (s_sens_batt_legend) lv_obj_add_flag(s_sens_batt_legend, LV_OBJ_FLAG_HIDDEN);
+    }
+  }
+}
 
 static void refreshSensorsTab() {
   if (!g_lv.task) return;
@@ -26445,18 +27738,39 @@ static void refreshSensorsTab() {
 
   // GPS block
   if (s_sens_gps_lbl) {
-    char gps[160];
+    char gps[256];
     if (!snap.gps_present) {
       snprintf(gps, sizeof gps, "No GPS");
     } else {
       size_t p = 0;
-      p += snprintf(gps + p, sizeof gps - p, "Fix: %s", snap.gps_fix ? "yes" : "no");
+      p += snprintf(gps + p, sizeof gps - p, "State: %s",
+                    snap.gps_enabled ? "enabled" : "disabled");
+      p += snprintf(gps + p, sizeof gps - p, "\nFix: %s",
+                    snap.gps_fix ? "yes" : "no");
       if (snap.gps_sats >= 0)
         p += snprintf(gps + p, sizeof gps - p, "  Sats: %d", snap.gps_sats);
+      if (g_lv.task)
+        p += snprintf(gps + p, sizeof gps - p, "\nSeen this boot: %s",
+                      g_lv.task->getGpsHadFix() ? "yes" : "no");
+      if (s_gps_speed_kmh > 0.1f)
+        p += snprintf(gps + p, sizeof gps - p, "\nSpeed: %.1f km/h", (double)s_gps_speed_kmh);
+      if (s_gps_course_deg >= 0.0f)
+        p += snprintf(gps + p, sizeof gps - p, "  Course: %.0f\xC2\xB0 %s",
+                      (double)s_gps_course_deg, bearingCardinal(s_gps_course_deg));
+      p += snprintf(gps + p, sizeof gps - p, "\nHDOP: n/a");
+      if (s_gps_last_fix_ms != 0)
+        p += snprintf(gps + p, sizeof gps - p, "\nFix age: %lus",
+                      (unsigned long)((millis() - s_gps_last_fix_ms) / 1000UL));
+      if (!snap.gps_fix && s_gps_last_loss_ms != 0)
+        p += snprintf(gps + p, sizeof gps - p, "  Lost: %lus",
+                      (unsigned long)((millis() - s_gps_last_loss_ms) / 1000UL));
       if (snap.gps_fix) {
         const double lat = g_lv.task->getNodeLat();
         const double lon = g_lv.task->getNodeLon();
-        p += snprintf(gps + p, sizeof gps - p, "\n%.5f  %.5f", lat, lon);
+        p += snprintf(gps + p, sizeof gps - p, "\nLive: %.5f  %.5f", lat, lon);
+      } else if (g_lv.task && (g_lv.task->getNodeLat() != 0.0 || g_lv.task->getNodeLon() != 0.0)) {
+        p += snprintf(gps + p, sizeof gps - p, "\nSaved: %.5f  %.5f",
+                      g_lv.task->getNodeLat(), g_lv.task->getNodeLon());
       }
     }
     setLabelIfChanged(s_sens_gps_lbl, gps);
@@ -26472,6 +27786,81 @@ static void refreshSensorsTab() {
     setLabelIfChanged(s_sens_batt_lbl, batt);
   }
 
+  if (s_sens_alerts_lbl) {
+    int hist_alt_min = INT_MAX, hist_alt_max = INT_MIN;
+    int16_t first_alt = INT16_MIN, last_alt = INT16_MIN;
+    for (int i = 0; i < kHomeEnvHistoryPoints; ++i) {
+      if (s_home_env_hist_alt_m[i] == INT16_MIN) continue;
+      if (s_home_env_hist_alt_m[i] < hist_alt_min) hist_alt_min = s_home_env_hist_alt_m[i];
+      if (s_home_env_hist_alt_m[i] > hist_alt_max) hist_alt_max = s_home_env_hist_alt_m[i];
+      if (first_alt == INT16_MIN) first_alt = s_home_env_hist_alt_m[i];
+      last_alt = s_home_env_hist_alt_m[i];
+    }
+    const bool weather_on = touchPrefsGetWeatherAlarm();
+    const bool sound_on = touchPrefsGetWeatherAlarmSound();
+    const bool hum_high = (snap.have_bme_hum && snap.bme_hum_pct >= 85.0f) ||
+                          (snap.have_gxhtv3_hum && snap.gxhtv3_hum_pct >= 85.0f);
+    const char* pressure_level = "stable";
+    if (s_pressure_alarm_last_drop_hpa10 >= kPressureAlarmDropHpa10 * 2) pressure_level = "storm";
+    else if (s_pressure_alarm_last_drop_hpa10 >= kPressureAlarmDropHpa10) pressure_level = "watch";
+    else if (s_pressure_alarm_last_drop_hpa10 >= kPressureAlarmDropHpa10 / 2) pressure_level = "trend";
+    char alerts[320];
+    size_t p = 0;
+    p += snprintf(alerts + p, sizeof alerts - p, "Weather: %s  Sound: %s",
+                  weather_on ? "armed" : "off",
+                  sound_on ? "on" : "off");
+    if (s_pressure_alarm_last_window_min > 0) {
+      p += snprintf(alerts + p, sizeof alerts - p, "\nPressure: %s %.1f hPa / %u min",
+                    s_pressure_alarm_active ? "alert" : pressure_level,
+                    (double)s_pressure_alarm_last_drop_hpa10 / 10.0,
+                    (unsigned)s_pressure_alarm_last_window_min);
+    } else {
+      p += snprintf(alerts + p, sizeof alerts - p, "\nPressure: stable");
+    }
+    if (hum_high) {
+      const double hum_pct = snap.have_bme_hum ? (double)snap.bme_hum_pct : (double)snap.gxhtv3_hum_pct;
+      p += snprintf(alerts + p, sizeof alerts - p, "  Hum: %.0f%%", hum_pct);
+    }
+    if (hist_alt_min != INT_MAX && hist_alt_max != INT_MIN) {
+      p += snprintf(alerts + p, sizeof alerts - p, "\nAltitude window: %d .. %d m",
+                    hist_alt_min, hist_alt_max);
+      if (first_alt != INT16_MIN && last_alt != INT16_MIN) {
+        p += snprintf(alerts + p, sizeof alerts - p, "  trend %+d m", (int)(last_alt - first_alt));
+      }
+    } else if (snap.have_bme_alt) {
+      p += snprintf(alerts + p, sizeof alerts - p, "\nAltitude now: %d m", (int)snap.bme_alt_m);
+    }
+    if (s_track_recording) {
+      p += snprintf(alerts + p, sizeof alerts - p, "\nTrack REC: %.1f km  %lu pt",
+                    (double)s_track_total_km, (unsigned long)s_track_point_count);
+      if (s_track_alt_min_m != INT16_MAX && s_track_alt_max_m != INT16_MIN) {
+        p += snprintf(alerts + p, sizeof alerts - p, "  alt %d..%d",
+                      (int)s_track_alt_min_m, (int)s_track_alt_max_m);
+      }
+    } else {
+      p += snprintf(alerts + p, sizeof alerts - p, "\nTrack: idle");
+    }
+    if (s_track_low_batt_alerted) {
+      p += snprintf(alerts + p, sizeof alerts - p, "\nBattery: low event seen during REC");
+    } else if (snap.have_batt) {
+      p += snprintf(alerts + p, sizeof alerts - p, "\nBattery guard: %.2f V threshold %.2f V",
+                    (double)snap.batt_v, (double)k_track_batt_low_v);
+    }
+    if (snap.gps_present) {
+      p += snprintf(alerts + p, sizeof alerts - p, "\nGPS: %s",
+                    snap.gps_fix ? "fix" : "no fix");
+      if (s_gps_last_fix_ms != 0) {
+        p += snprintf(alerts + p, sizeof alerts - p, "  age %lus",
+                      (unsigned long)((millis() - s_gps_last_fix_ms) / 1000UL));
+      }
+      if (!snap.gps_fix && s_gps_last_loss_ms != 0) {
+        p += snprintf(alerts + p, sizeof alerts - p, "  lost %lus",
+                      (unsigned long)((millis() - s_gps_last_loss_ms) / 1000UL));
+      }
+    }
+    setLabelIfChanged(s_sens_alerts_lbl, alerts);
+  }
+
   // Footer timestamp
   if (s_sens_time_lbl) {
     char ts[24];
@@ -26481,6 +27870,8 @@ static void refreshSensorsTab() {
     else     snprintf(ts, sizeof ts, "Updated --:--:--");
     setLabelIfChanged(s_sens_time_lbl, ts);
   }
+
+  refreshSensorsHistoryCharts();
 }
 
 static lv_obj_t* sensorsAddSection(lv_obj_t* page, int& y, const char* title) {
@@ -26510,7 +27901,77 @@ static void makeSensorsTab(lv_obj_t* tab) {
 
   s_sens_atmo_lbl = sensorsAddSection(tab, y, LV_SYMBOL_CHARGE "  Atmosphere");
   lv_label_set_text(s_sens_atmo_lbl, "...");
-  y += SC(72);
+  s_sens_env_chart = lv_chart_create(tab);
+  lv_obj_set_size(s_sens_env_chart, lv_pct(100) - SC(16), SC(74));
+  lv_obj_set_pos(s_sens_env_chart, 8, y + SC(56));
+  lv_obj_clear_flag(s_sens_env_chart, LV_OBJ_FLAG_SCROLLABLE);
+  lv_chart_set_type(s_sens_env_chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(s_sens_env_chart, kHomeEnvHistoryPoints);
+  lv_chart_set_range(s_sens_env_chart, LV_CHART_AXIS_PRIMARY_Y, -10, 60);
+  lv_chart_set_range(s_sens_env_chart, LV_CHART_AXIS_SECONDARY_Y, 0, 100);
+  lv_chart_set_div_line_count(s_sens_env_chart, 3, 4);
+  lv_obj_set_style_bg_color(s_sens_env_chart, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_sens_env_chart, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(s_sens_env_chart, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(s_sens_env_chart, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(s_sens_env_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_line_color(s_sens_env_chart, lv_color_hex(0x1A1D1F), LV_PART_MAIN);
+  lv_obj_set_style_text_font(s_sens_env_chart, &g_font_12, LV_PART_TICKS);
+  lv_obj_set_style_text_color(s_sens_env_chart, lv_color_hex(COLOR_SUB), LV_PART_TICKS);
+  lv_obj_set_style_line_color(s_sens_env_chart, lv_color_hex(0x2A2E30), LV_PART_TICKS);
+  lv_obj_set_style_pad_left(s_sens_env_chart, 4, LV_PART_TICKS);
+  lv_obj_set_style_pad_top(s_sens_env_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(s_sens_env_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_size(s_sens_env_chart, 0, LV_PART_INDICATOR);
+  lv_obj_set_style_line_width(s_sens_env_chart, 2, LV_PART_ITEMS);
+  lv_chart_set_axis_tick(s_sens_env_chart, LV_CHART_AXIS_PRIMARY_Y, 4, 0, 3, 1, true, 34);
+  lv_chart_set_axis_tick(s_sens_env_chart, LV_CHART_AXIS_SECONDARY_Y, 4, 0, 3, 1, true, 30);
+  s_sens_env_temp = lv_chart_add_series(s_sens_env_chart, lv_color_hex(0xF5A623), LV_CHART_AXIS_PRIMARY_Y);
+  s_sens_env_hum  = lv_chart_add_series(s_sens_env_chart, lv_color_hex(0x35C9C9), LV_CHART_AXIS_SECONDARY_Y);
+  lv_chart_set_all_value(s_sens_env_chart, s_sens_env_temp, LV_CHART_POINT_NONE);
+  lv_chart_set_all_value(s_sens_env_chart, s_sens_env_hum,  LV_CHART_POINT_NONE);
+  s_sens_env_legend = lv_label_create(tab);
+  lv_label_set_text(s_sens_env_legend, TR("Orange temp  Cyan humidity"));
+  lv_obj_set_style_text_font(s_sens_env_legend, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_sens_env_legend, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(s_sens_env_legend, 8, y + SC(56 + 74 + 4));
+  y += SC(152);
+
+  s_sens_press_chart = lv_chart_create(tab);
+  lv_obj_set_size(s_sens_press_chart, lv_pct(100) - SC(16), SC(74));
+  lv_obj_set_pos(s_sens_press_chart, 8, y);
+  lv_obj_clear_flag(s_sens_press_chart, LV_OBJ_FLAG_SCROLLABLE);
+  lv_chart_set_type(s_sens_press_chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(s_sens_press_chart, kHomeEnvHistoryPoints);
+  lv_chart_set_range(s_sens_press_chart, LV_CHART_AXIS_PRIMARY_Y, 700, 1100);
+  lv_chart_set_range(s_sens_press_chart, LV_CHART_AXIS_SECONDARY_Y, 0, 4000);
+  lv_chart_set_div_line_count(s_sens_press_chart, 3, 4);
+  lv_obj_set_style_bg_color(s_sens_press_chart, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_sens_press_chart, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(s_sens_press_chart, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(s_sens_press_chart, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(s_sens_press_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_line_color(s_sens_press_chart, lv_color_hex(0x1A1D1F), LV_PART_MAIN);
+  lv_obj_set_style_text_font(s_sens_press_chart, &g_font_12, LV_PART_TICKS);
+  lv_obj_set_style_text_color(s_sens_press_chart, lv_color_hex(COLOR_SUB), LV_PART_TICKS);
+  lv_obj_set_style_line_color(s_sens_press_chart, lv_color_hex(0x2A2E30), LV_PART_TICKS);
+  lv_obj_set_style_pad_left(s_sens_press_chart, 4, LV_PART_TICKS);
+  lv_obj_set_style_pad_top(s_sens_press_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(s_sens_press_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_size(s_sens_press_chart, 0, LV_PART_INDICATOR);
+  lv_obj_set_style_line_width(s_sens_press_chart, 2, LV_PART_ITEMS);
+  lv_chart_set_axis_tick(s_sens_press_chart, LV_CHART_AXIS_PRIMARY_Y, 4, 0, 3, 1, true, 34);
+  lv_chart_set_axis_tick(s_sens_press_chart, LV_CHART_AXIS_SECONDARY_Y, 4, 0, 3, 1, true, 34);
+  s_sens_press_ser = lv_chart_add_series(s_sens_press_chart, lv_color_hex(0x79D36B), LV_CHART_AXIS_PRIMARY_Y);
+  s_sens_alt_ser   = lv_chart_add_series(s_sens_press_chart, lv_color_hex(0xA7B2BF), LV_CHART_AXIS_SECONDARY_Y);
+  lv_chart_set_all_value(s_sens_press_chart, s_sens_press_ser, LV_CHART_POINT_NONE);
+  lv_chart_set_all_value(s_sens_press_chart, s_sens_alt_ser, LV_CHART_POINT_NONE);
+  s_sens_press_legend = lv_label_create(tab);
+  lv_label_set_text(s_sens_press_legend, TR("Green pressure  Gray altitude"));
+  lv_obj_set_style_text_font(s_sens_press_legend, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_sens_press_legend, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(s_sens_press_legend, 8, y + SC(74 + 4));
+  y += SC(110);
 
   // Divider
   {
@@ -26525,7 +27986,7 @@ static void makeSensorsTab(lv_obj_t* tab) {
 
   s_sens_gps_lbl = sensorsAddSection(tab, y, LV_SYMBOL_GPS "  GPS");
   lv_label_set_text(s_sens_gps_lbl, "...");
-  y += SC(54);
+  y += SC(82);
 
   // Divider
   {
@@ -26540,7 +28001,52 @@ static void makeSensorsTab(lv_obj_t* tab) {
 
   s_sens_batt_lbl = sensorsAddSection(tab, y, LV_SYMBOL_BATTERY_FULL "  Battery");
   lv_label_set_text(s_sens_batt_lbl, "...");
-  y += SC(28);
+  s_sens_batt_chart = lv_chart_create(tab);
+  lv_obj_set_size(s_sens_batt_chart, lv_pct(100) - SC(16), SC(70));
+  lv_obj_set_pos(s_sens_batt_chart, 8, y + SC(30));
+  lv_obj_clear_flag(s_sens_batt_chart, LV_OBJ_FLAG_SCROLLABLE);
+  lv_chart_set_type(s_sens_batt_chart, LV_CHART_TYPE_LINE);
+  lv_chart_set_point_count(s_sens_batt_chart, kHomeEnvHistoryPoints);
+  lv_chart_set_range(s_sens_batt_chart, LV_CHART_AXIS_PRIMARY_Y, 3400, 4600);
+  lv_chart_set_div_line_count(s_sens_batt_chart, 3, 4);
+  lv_obj_set_style_bg_color(s_sens_batt_chart, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(s_sens_batt_chart, LV_OPA_COVER, LV_PART_MAIN);
+  lv_obj_set_style_border_color(s_sens_batt_chart, lv_color_hex(0x18191A), LV_PART_MAIN);
+  lv_obj_set_style_border_width(s_sens_batt_chart, 1, LV_PART_MAIN);
+  lv_obj_set_style_radius(s_sens_batt_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_line_color(s_sens_batt_chart, lv_color_hex(0x1A1D1F), LV_PART_MAIN);
+  lv_obj_set_style_text_font(s_sens_batt_chart, &g_font_12, LV_PART_TICKS);
+  lv_obj_set_style_text_color(s_sens_batt_chart, lv_color_hex(COLOR_SUB), LV_PART_TICKS);
+  lv_obj_set_style_line_color(s_sens_batt_chart, lv_color_hex(0x2A2E30), LV_PART_TICKS);
+  lv_obj_set_style_pad_left(s_sens_batt_chart, 4, LV_PART_TICKS);
+  lv_obj_set_style_pad_top(s_sens_batt_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_pad_bottom(s_sens_batt_chart, 6, LV_PART_MAIN);
+  lv_obj_set_style_size(s_sens_batt_chart, 0, LV_PART_INDICATOR);
+  lv_obj_set_style_line_width(s_sens_batt_chart, 2, LV_PART_ITEMS);
+  lv_chart_set_axis_tick(s_sens_batt_chart, LV_CHART_AXIS_PRIMARY_Y, 4, 0, 3, 1, true, 36);
+  lv_obj_add_event_cb(s_sens_batt_chart, battChartTickCb, LV_EVENT_DRAW_PART_BEGIN, nullptr);
+  s_sens_batt_ser = lv_chart_add_series(s_sens_batt_chart, lv_color_hex(0x4F9DF7), LV_CHART_AXIS_PRIMARY_Y);
+  lv_chart_set_all_value(s_sens_batt_chart, s_sens_batt_ser, LV_CHART_POINT_NONE);
+  s_sens_batt_legend = lv_label_create(tab);
+  lv_label_set_text(s_sens_batt_legend, TR("Blue battery  Last 6 min"));
+  lv_obj_set_style_text_font(s_sens_batt_legend, &g_font_12, LV_PART_MAIN);
+  lv_obj_set_style_text_color(s_sens_batt_legend, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+  lv_obj_set_pos(s_sens_batt_legend, 8, y + SC(30 + 70 + 4));
+  y += SC(120);
+
+  {
+    lv_obj_t* div = lv_obj_create(tab);
+    lv_obj_remove_style_all(div);
+    lv_obj_set_size(div, lv_pct(100) - SC(16), 1);
+    lv_obj_set_pos(div, 8, y);
+    lv_obj_set_style_bg_color(div, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(div, LV_OPA_20, LV_PART_MAIN);
+    y += SC(10);
+  }
+
+  s_sens_alerts_lbl = sensorsAddSection(tab, y, LV_SYMBOL_WARNING "  Terrain alerts");
+  lv_label_set_text(s_sens_alerts_lbl, "...");
+  y += SC(176);
 
   // Footer: last updated
   s_sens_time_lbl = lv_label_create(tab);
@@ -27857,6 +29363,357 @@ static void uiDataRemove(const char* name) {
   if (!uiDataFsReady()) return;
   char p[80]; snprintf(p, sizeof p, "%s%s", s_ui_data_root, name);
   s_ui_data_fs->remove(p);
+}
+
+static const char* waypointDisplayName(const LocalWaypoint& wp) {
+  return wp.name[0] ? wp.name : (wp.rally ? "Rally point" : "Waypoint");
+}
+
+static int findRallyWaypoint() {
+  for (int i = 0; i < k_local_waypoints_max; ++i)
+    if (s_waypoints[i].used && s_waypoints[i].rally) return i;
+  return -1;
+}
+
+static uint32_t navNowUnix() {
+  mesh::RTCClock* rtc = the_mesh.getRTCClock();
+  return rtc ? rtc->getCurrentTime() : 0;
+}
+
+static bool saveWaypointsToStorage() {
+#if defined(ESP32)
+  File f = uiDataOpen(k_ui_waypoints_path, "w");
+  if (!f) return false;
+  UiWaypointFileHeader hdr{};
+  hdr.magic = k_ui_waypoints_magic;
+  hdr.version = k_ui_waypoints_version;
+  hdr.rec_size = static_cast<uint16_t>(sizeof(UiWaypointRec));
+  hdr.selected_idx = static_cast<uint16_t>(s_waypoint_selected >= 0 ? s_waypoint_selected : 0xFFFFu);
+  for (int i = 0; i < k_local_waypoints_max; ++i) if (s_waypoints[i].used) ++hdr.count;
+  if (f.write(reinterpret_cast<const uint8_t*>(&hdr), sizeof hdr) != sizeof hdr) {
+    f.close();
+    return false;
+  }
+  UiWaypointRec rec{};
+  for (int i = 0; i < k_local_waypoints_max; ++i) {
+    memset(&rec, 0, sizeof rec);
+    rec.used = s_waypoints[i].used ? 1u : 0u;
+    rec.flags = s_waypoints[i].rally ? 0x1u : 0u;
+    rec.lat_e6 = s_waypoints[i].lat_e6;
+    rec.lon_e6 = s_waypoints[i].lon_e6;
+    rec.created_ts = s_waypoints[i].created_ts;
+    strncpy(rec.name, s_waypoints[i].name, sizeof rec.name - 1);
+    strncpy(rec.note, s_waypoints[i].note, sizeof rec.note - 1);
+    if (f.write(reinterpret_cast<const uint8_t*>(&rec), sizeof rec) != sizeof rec) {
+      f.close();
+      return false;
+    }
+  }
+  f.close();
+  s_waypoints_dirty = false;
+  return true;
+#else
+  return false;
+#endif
+}
+
+static void ensureWaypointsLoaded() {
+  if (s_waypoints_loaded) return;
+  s_waypoints_loaded = true;
+#if defined(ESP32)
+  File f = uiDataOpen(k_ui_waypoints_path, "r");
+  if (!f) return;
+  UiWaypointFileHeader hdr{};
+  if (f.readBytes(reinterpret_cast<char*>(&hdr), sizeof hdr) != static_cast<int>(sizeof hdr) ||
+      hdr.magic != k_ui_waypoints_magic || hdr.version != k_ui_waypoints_version ||
+      hdr.rec_size != sizeof(UiWaypointRec)) {
+    f.close();
+    uiDataRemove(k_ui_waypoints_path);
+    return;
+  }
+  UiWaypointRec rec{};
+  for (int i = 0; i < k_local_waypoints_max; ++i) {
+    if (f.readBytes(reinterpret_cast<char*>(&rec), sizeof rec) != static_cast<int>(sizeof rec)) break;
+    s_waypoints[i].used = rec.used != 0;
+    s_waypoints[i].rally = (rec.flags & 0x1u) != 0;
+    s_waypoints[i].lat_e6 = rec.lat_e6;
+    s_waypoints[i].lon_e6 = rec.lon_e6;
+    s_waypoints[i].created_ts = rec.created_ts;
+    strncpy(s_waypoints[i].name, rec.name, sizeof s_waypoints[i].name - 1);
+    strncpy(s_waypoints[i].note, rec.note, sizeof s_waypoints[i].note - 1);
+  }
+  f.close();
+  s_waypoint_selected = (hdr.selected_idx < k_local_waypoints_max) ? (int)hdr.selected_idx : -1;
+  if (s_waypoint_selected >= 0 && !s_waypoints[s_waypoint_selected].used) s_waypoint_selected = -1;
+  if (s_waypoint_selected >= 0) s_nav_target_wp = s_waypoint_selected;
+#endif
+}
+
+static int allocWaypointSlot() {
+  ensureWaypointsLoaded();
+  for (int i = 0; i < k_local_waypoints_max; ++i) if (!s_waypoints[i].used) return i;
+  return -1;
+}
+
+static void setWaypointSelected(int idx) {
+  ensureWaypointsLoaded();
+  if (idx < 0 || idx >= k_local_waypoints_max || !s_waypoints[idx].used) idx = -1;
+  s_waypoint_selected = idx;
+  s_nav_target_wp = idx;
+  s_waypoints_dirty = true;
+}
+
+static bool addWaypointAt(double lat, double lon, bool rally, const char* name, const char* note) {
+  if (lat == 0.0 && lon == 0.0) return false;
+  ensureWaypointsLoaded();
+  const int slot = rally ? ((findRallyWaypoint() >= 0) ? findRallyWaypoint() : allocWaypointSlot()) : allocWaypointSlot();
+  if (slot < 0) return false;
+  if (rally) {
+    for (int i = 0; i < k_local_waypoints_max; ++i) s_waypoints[i].rally = false;
+  }
+  LocalWaypoint& wp = s_waypoints[slot];
+  wp.used = true;
+  wp.rally = rally;
+  wp.lat_e6 = (int32_t)lround(lat * 1.0e6);
+  wp.lon_e6 = (int32_t)lround(lon * 1.0e6);
+  if (wp.created_ts == 0) wp.created_ts = navNowUnix();
+  if (name && name[0]) snprintf(wp.name, sizeof wp.name, "%s", name);
+  else if (rally) snprintf(wp.name, sizeof wp.name, "Rally point");
+  else snprintf(wp.name, sizeof wp.name, "WP %d", slot + 1);
+  snprintf(wp.note, sizeof wp.note, "%s", note ? note : "");
+  setWaypointSelected(slot);
+  return saveWaypointsToStorage();
+}
+
+static void deleteWaypoint(int idx) {
+  ensureWaypointsLoaded();
+  if (idx < 0 || idx >= k_local_waypoints_max || !s_waypoints[idx].used) return;
+  s_waypoints[idx] = LocalWaypoint{};
+  if (s_waypoint_selected == idx) s_waypoint_selected = -1;
+  if (s_nav_target_wp == idx) s_nav_target_wp = -1;
+  saveWaypointsToStorage();
+}
+
+static bool gpsTrackOutputPath(char* out, size_t cap, bool gpx) {
+  if (!out || cap == 0) return false;
+  const uint32_t ts = navNowUnix();
+#if defined(HAS_TDECK_GT911)
+  if (fmSdTryMount()) {
+    SD.mkdir("/meshcomod");
+    SD.mkdir("/meshcomod/tracks");
+    snprintf(out, cap, "/meshcomod/tracks/track-%lu.%s",
+             static_cast<unsigned long>(ts ? ts : millis()),
+             gpx ? "gpx" : "csv");
+    return true;
+  }
+#endif
+  snprintf(out, cap, "/track-%lu.%s",
+           static_cast<unsigned long>(ts ? ts : millis()),
+           gpx ? "gpx" : "csv");
+  return true;
+}
+
+static void resetTrackState(bool clear_file) {
+  s_track_recording = false;
+  s_track_has_points = false;
+  s_track_low_batt_alerted = false;
+  s_track_last_sample_ms = 0;
+  s_track_last_lat = 0.0;
+  s_track_last_lon = 0.0;
+  s_track_total_km = 0.0f;
+  s_track_point_count = 0;
+  s_track_alt_min_m = INT16_MAX;
+  s_track_alt_max_m = INT16_MIN;
+  if (clear_file) uiDataRemove(k_ui_track_path);
+}
+
+static bool appendTrackPointCsv(uint32_t now_ms, double lat, double lon,
+                                int16_t alt_m, int16_t press_hpa10, uint16_t batt_mv) {
+#if defined(ESP32)
+  File f = uiDataOpen(k_ui_track_path, "a");
+  if (!f) return false;
+  char line[128];
+  snprintf(line, sizeof line, "%lu,%.6f,%.6f,%d,%.1f,%.3f\n",
+           static_cast<unsigned long>(now_ms),
+           lat, lon, (int)alt_m,
+           (double)press_hpa10 / 10.0,
+           (double)batt_mv / 1000.0);
+  const bool ok = f.print(line) == strlen(line);
+  f.close();
+  return ok;
+#else
+  return false;
+#endif
+}
+
+static bool exportTrackToGpx(char* out_path, size_t out_cap) {
+#if defined(ESP32)
+  File in = uiDataOpen(k_ui_track_path, "r");
+  if (!in) return false;
+  char path[96];
+  gpsTrackOutputPath(path, sizeof path, true);
+#if defined(HAS_TDECK_GT911)
+  fs::FS* out_fs = (fmSdTryMount() ? &SD : &SPIFFS);
+#else
+  fs::FS* out_fs = &SPIFFS;
+#endif
+  File out = out_fs->open(path, "w");
+  if (!out) { in.close(); return false; }
+  out.print("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+  out.print("<gpx version=\"1.1\" creator=\"Wadamesh\">\n<trk><name>Wadamesh track</name><trkseg>\n");
+  while (in.available()) {
+    char line[160];
+    const size_t n = in.readBytesUntil('\n', line, sizeof line - 1);
+    if (n == 0) continue;
+    line[n] = '\0';
+    unsigned long ms = 0;
+    double lat = 0.0, lon = 0.0, press = 0.0, batt = 0.0;
+    int alt = 0;
+    if (sscanf(line, "%lu,%lf,%lf,%d,%lf,%lf", &ms, &lat, &lon, &alt, &press, &batt) < 4) continue;
+    out.printf("<trkpt lat=\"%.6f\" lon=\"%.6f\"><ele>%d</ele>"
+               "<extensions><wadamesh:pressure_hpa>%.1f</wadamesh:pressure_hpa>"
+               "<wadamesh:battery_v>%.3f</wadamesh:battery_v></extensions></trkpt>\n",
+               lat, lon, alt, press, batt);
+  }
+  out.print("</trkseg></trk></gpx>\n");
+  out.close();
+  in.close();
+#if defined(HAS_TDECK_GT911)
+  if (out_path && out_cap) snprintf(out_path, out_cap, "%s%s", (out_fs == &SD) ? "SD " : "Internal ", path);
+#else
+  if (out_path && out_cap) snprintf(out_path, out_cap, "Internal %s", path);
+#endif
+  return true;
+#else
+  (void)out_path; (void)out_cap;
+  return false;
+#endif
+}
+
+static void gpsNavTick(unsigned long now_ms) {
+  ensureWaypointsLoaded();
+  if (!g_lv.task) return;
+  UITask::LocalEnvSnapshot snap;
+  g_lv.task->getLocalEnvSnapshot(snap);
+  const bool have_fix = snap.gps_fix;
+  const double lat = g_lv.task->getNodeLat();
+  const double lon = g_lv.task->getNodeLon();
+  if (have_fix && !(lat == 0.0 && lon == 0.0)) {
+    s_gps_last_fix_ms = now_ms;
+    if (s_gps_last_calc_ms != 0 && (int32_t)(now_ms - s_gps_last_calc_ms) >= 5000) {
+      const double step_km = contactDistanceKm(s_gps_last_calc_lat, s_gps_last_calc_lon, lat, lon);
+      const double dt_h = (double)(now_ms - s_gps_last_calc_ms) / 3600000.0;
+      if (dt_h > 0.0) s_gps_speed_kmh = (float)(step_km / dt_h);
+      if (step_km * 1000.0 >= 3.0) s_gps_course_deg = (float)bearingDegrees(s_gps_last_calc_lat, s_gps_last_calc_lon, lat, lon);
+    }
+    s_gps_last_calc_lat = lat;
+    s_gps_last_calc_lon = lon;
+    s_gps_last_calc_ms = now_ms;
+  } else if (s_gps_last_fix_ms != 0 && s_gps_last_loss_ms < s_gps_last_fix_ms) {
+    s_gps_last_loss_ms = now_ms;
+  }
+
+  if (!s_track_recording || !have_fix || (lat == 0.0 && lon == 0.0)) return;
+  if (s_track_last_sample_ms != 0 && (int32_t)(now_ms - s_track_last_sample_ms) < k_track_sample_every_ms) return;
+  const float moved_m = (s_track_has_points && !(s_track_last_lat == 0.0 && s_track_last_lon == 0.0))
+      ? (float)(contactDistanceKm(s_track_last_lat, s_track_last_lon, lat, lon) * 1000.0)
+      : 0.0f;
+  if (s_track_has_points && moved_m < k_track_move_min_m) return;
+  const int16_t alt_m = snap.have_bme_alt ? snap.bme_alt_m : INT16_MIN;
+  const int16_t press_hpa10 = snap.have_bme_pressure ? (int16_t)lroundf(snap.bme_pressure_hpa * 10.0f) : INT16_MIN;
+  const uint16_t batt_mv = snap.have_batt ? (uint16_t)lroundf(snap.batt_v * 1000.0f) : 0;
+  if (!appendTrackPointCsv(now_ms, lat, lon, alt_m, press_hpa10, batt_mv)) return;
+  s_track_last_sample_ms = now_ms;
+  if (s_track_has_points) s_track_total_km += moved_m / 1000.0f;
+  s_track_last_lat = lat;
+  s_track_last_lon = lon;
+  s_track_has_points = true;
+  ++s_track_point_count;
+  if (alt_m != INT16_MIN) {
+    if (s_track_alt_min_m == INT16_MAX || alt_m < s_track_alt_min_m) s_track_alt_min_m = alt_m;
+    if (s_track_alt_max_m == INT16_MIN || alt_m > s_track_alt_max_m) s_track_alt_max_m = alt_m;
+  }
+  if (!s_track_low_batt_alerted && batt_mv > 0 && batt_mv < (uint16_t)lroundf(k_track_batt_low_v * 1000.0f)) {
+    s_track_low_batt_alerted = true;
+    g_lv.task->showAlert(TR("Low battery during track recording"), 2200);
+  }
+}
+
+static bool sendWaypointToContact(uint32_t mesh_idx, const LocalWaypoint& wp) {
+  ContactInfo c;
+  if (!the_mesh.getContactByIdx(mesh_idx, c)) return false;
+  c.out_path_len = OUT_PATH_UNKNOWN;
+  char payload[160];
+  snprintf(payload, sizeof payload, "WDMWP|%c|%s|%.6f|%.6f|%s",
+           wp.rally ? 'R' : 'W',
+           waypointDisplayName(wp),
+           (double)wp.lat_e6 / 1.0e6,
+           (double)wp.lon_e6 / 1.0e6,
+           wp.note);
+  mesh::RTCClock* rtc = the_mesh.getRTCClock();
+  const uint32_t ts = rtc ? rtc->getCurrentTimeUnique() : millis();
+  uint32_t ack = 0, est = 0;
+  const int r = the_mesh.sendMessage(c, ts, 4, payload, ack, est);
+  if (r == MSG_SEND_FAILED) return false;
+  the_mesh.uiRegisterExpectedAck(ack, c.id.pub_key);
+  return true;
+}
+
+static bool importWaypointFromText(const char* sender, const char* text) {
+  if (!text || strncmp(text, "WDMWP|", 6) != 0) return false;
+  char buf[192];
+  snprintf(buf, sizeof buf, "%s", text);
+  char* parts[6] = {};
+  int n = 0;
+  for (char* tok = strtok(buf, "|"); tok && n < 6; tok = strtok(nullptr, "|")) parts[n++] = tok;
+  if (n < 5) return false;
+
+  bool remote_rally = false;
+  const char* name = nullptr;
+  const char* lat_s = nullptr;
+  const char* lon_s = nullptr;
+  const char* note_s = "";
+  if (n >= 6 && parts[1] && strlen(parts[1]) == 1 && (parts[1][0] == 'R' || parts[1][0] == 'W')) {
+    remote_rally = (parts[1][0] == 'R');
+    name = parts[2];
+    lat_s = parts[3];
+    lon_s = parts[4];
+    note_s = parts[5] ? parts[5] : "";
+  } else {
+    name = parts[1];
+    lat_s = parts[2];
+    lon_s = parts[3];
+    note_s = parts[4] ? parts[4] : "";
+  }
+  if (!name || !lat_s || !lon_s) return false;
+
+  const double lat = atof(lat_s);
+  const double lon = atof(lon_s);
+  if (lat == 0.0 && lon == 0.0) return false;
+
+  char note[48];
+  if (sender && sender[0] && note_s[0]) snprintf(note, sizeof note, "%s | %s", sender, note_s);
+  else if (sender && sender[0])         snprintf(note, sizeof note, "shared by %s", sender);
+  else                                  snprintf(note, sizeof note, "%s", note_s);
+
+  char name_buf[24];
+  if (remote_rally) snprintf(name_buf, sizeof name_buf, "RV %s", name[0] ? name : "point");
+  else              snprintf(name_buf, sizeof name_buf, "%s", name);
+
+  ensureWaypointsLoaded();
+  for (int i = 0; i < k_local_waypoints_max; ++i) {
+    LocalWaypoint& wp = s_waypoints[i];
+    if (!wp.used) continue;
+    if (abs(wp.lat_e6 - (int32_t)lround(lat * 1.0e6)) > 40) continue;
+    if (abs(wp.lon_e6 - (int32_t)lround(lon * 1.0e6)) > 40) continue;
+    snprintf(wp.name, sizeof wp.name, "%s", name_buf);
+    snprintf(wp.note, sizeof wp.note, "%s", note);
+    saveWaypointsToStorage();
+    return true;
+  }
+
+  if (!addWaypointAt(lat, lon, false, name_buf, note)) return false;
+  return true;
 }
 
 // Shared helper: read one on-disk record into a zero-initialized current-layout
@@ -30117,6 +31974,20 @@ void UITask::newMsgImpl(uint8_t path_len, const char* from_name, const char* tex
     if (emb_ts > 1700000000) _ui_msgs[msg_slot].ts = emb_ts;
   }
   syncThreadMeshSlots(thread, channel);
+  if (importWaypointFromText(sender, body)) {
+    if (getActiveTab() == MAP_TAB_INDEX) {
+      renderMapMarkers();
+      refreshMapInfoLabel();
+    }
+    if (s_waypoint_mgr_status) refreshWaypointManager();
+    if (g_lv.task) {
+      char msg[96];
+      snprintf(msg, sizeof msg, "Waypoint imported%s%s",
+               sender && sender[0] ? " from " : "",
+               sender && sender[0] ? sender : "");
+      g_lv.task->showAlert(msg, 1800);
+    }
+  }
 #if defined(HAS_TDECK_GT911)
   // Mirror incoming traffic into the terminal live feed (only while it's open).
   // Runs on the mesh thread (core 1, same as the UI loop) so the append is safe.
@@ -30214,6 +32085,7 @@ void UITask::loop() {
   { static bool s_disc_loaded = false; if (!s_disc_loaded) { s_disc_loaded = true; loadDiscovered(); } }
   discoveredFlushIfDue(now);   // persist the discovered ring (rate-capped) so it survives reboot
   updateGpsLocation(now);   // sync + persist node location from GPS once fixed
+  gpsNavTick(now);          // derive nav stats + sample the local track recorder
   ++s_live_diag_loops;
   if (_alert_expiry != 0 && now >= _alert_expiry) {
     _alert[0]     = '\0';
@@ -30762,3 +32634,5 @@ static bool anyLateModalOpen() {
     s_wifi_scan_popup || s_backup_picker || s_batt_chart_root || s_appgrid_sheet ||
     s_emoji_sheet || s_disc_settings_root || s_map_opts_root;
 }
+
+#endif  // HAS_TOUCH_UI
