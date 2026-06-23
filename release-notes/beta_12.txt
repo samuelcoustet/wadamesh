@@ -1,0 +1,12 @@
+# beta_12 — what's new (one user-facing note per non-blank, non-# line; # lines are section comments)
+
+# --- Sensors / awareness ---
+New Sensors tab sits between Map and Settings and brings the local environment, GPS, battery, terrain alerts, altitude trend, track recording guard, and GPS fix/loss status together in one place.
+The Home and control surfaces now expose rotation state more clearly, with a compact rotation chip plus a persistent rotation-lock toggle in Display settings.
+
+# --- Map / waypoints ---
+Map tile downloads now have a proper queue manager: pause and resume downloads, retry failed tiles, queue the current map area, and clear finished jobs without leaving the device UI.
+Incoming `WDMWP|...` messages can now import waypoints directly into the local map, with duplicate coordinates updated instead of creating clutter.
+
+# --- Stability ---
+Several follow-up stability fixes landed across the touch UI: safer buffers, fewer race conditions, and more reliable waypoint persistence across reboot.
