@@ -3087,8 +3087,7 @@ static void versionCheckUpdateUi() {
 static lv_obj_t* s_ota_status_lbl = nullptr;   // live OTA status line (About page)
 static lv_obj_t* s_ota_btn        = nullptr;   // "Install update" button (greyed when up to date)
 static lv_obj_t* s_ota_btn_lbl    = nullptr;   // its caption (recoloured when disabled)
-static lv_obj_t* s_ota_prev_btn[3] = {nullptr,nullptr,nullptr};   // "reinstall beta_(latest-k)" buttons (k=1..3)
-static lv_obj_t* s_ota_prev_lbl[3] = {nullptr,nullptr,nullptr};   // their captions
+static lv_obj_t* s_ota_prev_btn = nullptr;   // single "Install a previous version" button (opens the version-picker popup)
 
 // Enable the OTA button only when an update is actually available — or when the
 // check hasn't completed yet (offline / still checking), so the user isn't
@@ -3111,23 +3110,12 @@ static void otaButtonRefreshState() {
     lv_obj_set_style_bg_opa(s_ota_btn, LV_OPA_20, LV_PART_MAIN);
     if (s_ota_btn_lbl) lv_obj_set_style_text_color(s_ota_btn_lbl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   }
-  // "Reinstall an earlier version" buttons: target beta_(latest-1), -2, -3. Hidden until the
-  // version check yields a latest_n, and only those that map to a real (>=1) beta are shown.
-  for (int k = 1; k <= 3; k++) {
-    lv_obj_t* b = s_ota_prev_btn[k - 1];
-    if (!b) continue;
-    int v = s_verchk_latest_n - k;
-    if (v >= 1) {
-      if (s_ota_prev_lbl[k - 1]) {
-        char pb[24];
-        snprintf(pb, sizeof pb, LV_SYMBOL_DOWNLOAD "  beta_%d", v);
-        lv_label_set_text(s_ota_prev_lbl[k - 1], pb);
-      }
-      lv_obj_set_user_data(b, (void*)(intptr_t)v);
-      lv_obj_clear_flag(b, LV_OBJ_FLAG_HIDDEN);
-    } else {
-      lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN);
-    }
+  // "Install a previous version" button: only meaningful once the version check
+  // yields a latest_n with at least one earlier beta below it (latest_n >= 2).
+  // Hidden until then; the popup it opens lists the actual betas.
+  if (s_ota_prev_btn) {
+    if (s_verchk_latest_n >= 2) lv_obj_clear_flag(s_ota_prev_btn, LV_OBJ_FLAG_HIDDEN);
+    else                        lv_obj_add_flag(s_ota_prev_btn, LV_OBJ_FLAG_HIDDEN);
   }
 }
 
@@ -3191,11 +3179,100 @@ static void otaStartInstall(int target_n) {
   if (!s_ota_poll_timer) s_ota_poll_timer = lv_timer_create(otaPollTimerCb, 400, nullptr);
 }
 
-// "Reinstall an earlier version" button cb — the chosen beta_N is stashed in the button user data.
+// ---- Previous-version flow: one button -> version-picker popup -> "are you sure?" -> install ----
+// The chosen beta_N is stashed module-static between the picker tap and the
+// confirm callback (SimpleCb is no-arg), mirroring the chatDelete pattern.
+static int        s_ota_pending_n  = -1;       // beta_N awaiting confirmation
+static lv_obj_t*  s_ota_prev_modal = nullptr;  // the version-picker overlay (backdrop root)
+
+// Async-delete the picker overlay (NEVER sync-del an overlay that may be mid-gesture — UAF).
+static void otaPrevModalClose() {
+  if (s_ota_prev_modal) { lv_obj_del_async(s_ota_prev_modal); s_ota_prev_modal = nullptr; }
+}
+static void otaPrevModalCloseCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  otaPrevModalClose();
+}
+
+// Confirm "Install beta_N?" was accepted -> kick off the (downgrade) install.
+static void otaConfirmInstallApply() {
+  otaStartInstall(s_ota_pending_n);
+}
+
+// A version row in the picker was tapped: stash the target, close the picker,
+// then raise the are-you-sure confirm before anything is downloaded.
 static void otaPrevPickCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   int v = (int)(intptr_t)lv_obj_get_user_data(lv_event_get_target(e));
-  if (v >= 1) otaStartInstall(v);
+  if (v < 1) return;
+  s_ota_pending_n = v;
+  otaPrevModalClose();
+  char m[96];
+  snprintf(m, sizeof m, "Install beta_%d?\nThis downgrades the firmware and reboots.", v);
+  showConfirm(m, "Install", otaConfirmInstallApply);
+}
+
+// "Install a previous version" button -> build the version-picker popup listing
+// the up-to-3 betas just below the latest. Tap-outside / X dismisses it.
+static void otaPrevVersionsCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  if (s_verchk_latest_n < 2) {   // no earlier release exists yet
+    if (g_lv.task) g_lv.task->showAlert(TR("No earlier versions yet"), 1500);
+    return;
+  }
+  otaPrevModalClose();
+
+  lv_coord_t sw = lv_disp_get_hor_res(nullptr);
+
+  // Backdrop: full-screen tap-catcher (tap outside the card = dismiss).
+  lv_obj_t* bg = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(bg);
+  lv_obj_set_size(bg, sw, lv_disp_get_ver_res(nullptr));
+  lv_obj_set_pos(bg, 0, 0);
+  lv_obj_set_style_bg_color(bg, lv_color_black(), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(bg, LV_OPA_50, LV_PART_MAIN);
+  lv_obj_clear_flag(bg, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_add_flag(bg, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(bg, otaPrevModalCloseCb, LV_EVENT_CLICKED, nullptr);
+  lv_obj_move_foreground(bg);
+  s_ota_prev_modal = bg;
+
+  // Card: centered, content-height, holds the title + version rows. NOT clickable,
+  // so taps on the card itself don't bubble to the backdrop and close it.
+  lv_obj_t* card = lv_obj_create(bg);
+  lv_obj_remove_style_all(card);
+  lv_obj_set_width(card, sw - SC(40));
+  lv_obj_set_height(card, LV_SIZE_CONTENT);
+  lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+  styleSurface(card, COLOR_PANEL, 10);
+  lv_obj_set_style_pad_all(card, 12, LV_PART_MAIN);
+  lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(card, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_clear_flag(card, LV_OBJ_FLAG_CLICKABLE);
+  addCloseXBadge(card, otaPrevModalCloseCb);
+
+  lv_obj_t* title = lv_label_create(card);
+  lv_label_set_text(title, TR("Install an earlier version"));
+  lv_obj_set_style_text_font(title, &g_font_14, LV_PART_MAIN);
+  lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+
+  for (int k = 1; k <= 3; k++) {
+    int v = s_verchk_latest_n - k;
+    if (v < 1) break;
+    lv_obj_t* b = lv_btn_create(card);
+    lv_obj_set_size(b, lv_pct(90), 38);
+    styleButton(b);
+    lv_obj_set_user_data(b, (void*)(intptr_t)v);
+    lv_obj_add_event_cb(b, otaPrevPickCb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* l = lv_label_create(b);
+    char bt[16];
+    snprintf(bt, sizeof bt, "beta_%d", v);
+    lv_label_set_text(l, bt);
+    lv_obj_set_style_text_font(l, &g_font_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_center(l);
+  }
 }
 #endif
 
@@ -20585,31 +20662,25 @@ static void settingsCatBuild(int cat) {
         otaButtonRefreshState();   // grey immediately if we already know we're current
 
 #if defined(ESP32) && defined(MULTI_TRANSPORT_COMPANION) && !defined(HAS_TANMATSU)
-        // "Reinstall an earlier version" — the 3 betas just below the latest. Subtler than the
-        // green Install button; labels/visibility are set by otaButtonRefreshState() once the
-        // version check yields a latest_n (and refreshed again immediately below if already known).
+        // "Install a previous version" — a single secondary button that opens a
+        // version-picker popup (then an are-you-sure confirm). Subtler than the
+        // green Install button so it reads as secondary. Starts HIDDEN; revealed
+        // by otaButtonRefreshState() once the version check yields a latest_n with
+        // at least one earlier beta below it.
         {
-          lv_obj_t* prev_hint = lv_label_create(page);
-          lv_obj_set_style_text_font(prev_hint, &g_font_12, LV_PART_MAIN);
-          lv_obj_set_style_text_color(prev_hint, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
-          lv_label_set_text(prev_hint, "Reinstall an earlier version:");
-        }
-        for (int k = 0; k < 3; k++) {
-          lv_obj_t* b = lv_btn_create(page);
-          lv_obj_set_size(b, lblw, 32);
-          styleButton(b);
-          lv_obj_set_style_bg_color(b, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
-          lv_obj_add_event_cb(b, otaPrevPickCb, LV_EVENT_CLICKED, nullptr);
-          lv_obj_t* l = lv_label_create(b);
-          lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
+          s_ota_prev_btn = lv_btn_create(page);
+          lv_obj_set_size(s_ota_prev_btn, lblw, 34);
+          styleButton(s_ota_prev_btn);
+          lv_obj_set_style_bg_color(s_ota_prev_btn, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
+          lv_obj_add_event_cb(s_ota_prev_btn, otaPrevVersionsCb, LV_EVENT_CLICKED, nullptr);
+          lv_obj_t* l = lv_label_create(s_ota_prev_btn);
+          lv_label_set_text(l, TR("Install a previous version"));
+          lv_obj_set_style_text_font(l, &g_font_14, LV_PART_MAIN);
           lv_obj_set_style_text_color(l, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
-          lv_label_set_text(l, "");
           lv_obj_center(l);
-          lv_obj_add_flag(b, LV_OBJ_FLAG_HIDDEN);   // shown by otaButtonRefreshState() if it maps to a real beta
-          s_ota_prev_btn[k] = b;
-          s_ota_prev_lbl[k] = l;
+          lv_obj_add_flag(s_ota_prev_btn, LV_OBJ_FLAG_HIDDEN);   // shown by otaButtonRefreshState() when an earlier beta exists
         }
-        otaButtonRefreshState();   // label + reveal the prev buttons if latest_n is already known
+        otaButtonRefreshState();   // reveal the button if latest_n is already known
 #endif
 
         s_ota_status_lbl = lv_label_create(page);
@@ -20674,7 +20745,7 @@ static void closeSettingsCategory() {
   if (s_settings_open_cat == CAT_ABOUT) {   // null the live-label ptrs (freed with the sheet)
     s_sysinfo_lbl = nullptr; s_update_about_lbl = nullptr; s_ota_status_lbl = nullptr;
     s_ota_btn = nullptr; s_ota_btn_lbl = nullptr;
-    for (int k = 0; k < 3; k++) { s_ota_prev_btn[k] = nullptr; s_ota_prev_lbl[k] = nullptr; }
+    s_ota_prev_btn = nullptr;
     g_lv.settings_status = nullptr; g_lv.diag_id_label = nullptr; g_lv.diag_label = nullptr;
   }
 #if defined(HAS_TDECK_GT911)
