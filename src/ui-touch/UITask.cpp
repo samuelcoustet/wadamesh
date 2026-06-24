@@ -10595,16 +10595,25 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
     has_los = peer_gps && self_gps;
   }
 #endif
+  bool has_map_btn = false;
+  if (!from_map) {
+    ContactInfo _mc;
+    has_map_btn = the_mesh.getContactByIdx(mesh_idx, _mc) && (_mc.gps_lat != 0 || _mc.gps_lon != 0);
+  }
   // Everything except Delete goes in a 2-column grid; Delete is a full-width
   // bottom row. Grid items = msg/ping + telemetry + range + favorite + reset +
   // block (6), + trace/admin for repeaters (2), + Join for rooms (1), +
-  // line-of-sight (1).
-  const int grid_items = (from_map ? 5 : 6) + (is_repeater ? 2 : 0) + (is_room ? 1 : 0) + (has_los ? 1 : 0);
+  // line-of-sight (1), + Show on map (1 when contact has GPS and !from_map).
+  const int grid_items = (from_map ? 5 : 6) + (is_repeater ? 2 : 0) + (is_room ? 1 : 0) + (has_los ? 1 : 0) + (has_map_btn ? 1 : 0);
   const int grid_rows  = (grid_items + 1) / 2;          // ceil
   const int card_h = title_h + (grid_rows + 1) * (btn_h + btn_gap) + padding;
+  // On landscape displays (sh=240) the backdrop is only 218px; cap the card
+  // to that space and let it scroll vertically when buttons overflow.
+  const int avail_card_h = sh - STATUSBAR_H - 4;
+  const int capped_card_h = LV_MIN(card_h, avail_card_h);
   lv_obj_t* card = lv_obj_create(s_action_sheet_root);
   lv_obj_remove_style_all(card);
-  lv_obj_set_size(card, card_w, card_h);
+  lv_obj_set_size(card, card_w, capped_card_h);
   lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
   lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
@@ -10612,7 +10621,11 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
   lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
   lv_obj_set_style_pad_all(card, padding, LV_PART_MAIN);
-  lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  if (card_h > capped_card_h) {
+    lv_obj_set_scroll_dir(card, LV_DIR_VER);
+  } else {
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+  }
   addCloseXBadge(card, actionSheetCloseCb);
 
   lv_obj_t* title = lv_label_create(card);
@@ -10682,13 +10695,8 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
     mk_btn(LV_SYMBOL_ENVELOPE "  Message", actionSheetSendMsgCb, 0);
   }
   mk_btn(LV_SYMBOL_BATTERY_3 "  Telemetry", actionSheetTelemetryCb, 0);
-  // Show on map — only when the contact has a location, and not when the sheet
-  // was opened from the map (you're already there).
-  if (!from_map) {
-    ContactInfo _mc;
-    if (the_mesh.getContactByIdx(s_action_sheet_mesh_idx, _mc) && (_mc.gps_lat != 0 || _mc.gps_lon != 0))
-      mk_btn(LV_SYMBOL_GPS "  Show on map", actionSheetShowOnMapCb, 0);
-  }
+  if (has_map_btn)
+    mk_btn(LV_SYMBOL_GPS "  Show on map", actionSheetShowOnMapCb, 0);
   if (is_repeater) {
     mk_btn(LV_SYMBOL_GPS      "  Trace SNR", actionSheetTracePingCb, 0);
     mk_btn(LV_SYMBOL_SETTINGS "  Admin",     actionSheetAdminCb,     0);
