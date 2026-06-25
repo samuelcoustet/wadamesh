@@ -21,8 +21,8 @@
   #include <esp_sleep.h>   // esp_deep_sleep_start / ext0 wakeup for the power-off menu
   #include <driver/rtc_io.h>   // rtc_gpio_pullup_en — hold the wake pin's level in deep sleep
   #include "assets/lockscreen_placeholder_jpg.h"   // seeded to SPIFFS /lock/placeholder.jpg on first boot (PNG decode is broken on this board)
-  #if defined(HAS_TDECK_GT911)
-    #include "assets/lockscreen_wallpaper_rgb565.h"   // crisp pre-dithered default lock-screen wallpaper (T-Deck only; no JPEG banding)
+  #if defined(HAS_TDECK_GT911) || defined(HAS_TANMATSU)
+    #include "assets/lockscreen_wallpaper_rgb565.h"   // crisp pre-dithered default lock-screen wallpaper (no JPEG banding)
   #endif
   #include <esp_timer.h>
   #include <esp_chip_info.h>
@@ -68,6 +68,7 @@
   #endif
 #elif defined(HAS_TANMATSU)
   #include <FFat.h>            // the file browser + DataStore use the internal 'locfd' FAT partition
+  #include <SD_MMC.h>          // microSD on the P4's SDMMC slot 0 (IOMUX 43/44/39-42); slot 1 = C6 radio
   extern bool g_fs_ok;         // set in main.cpp once FFat(locfd) is mounted
 #endif
 #include <Utils.h>
@@ -378,6 +379,14 @@ static lv_font_t* s_emoji_font[3] = { nullptr, nullptr, nullptr };  // one per t
 // stays the Normal size at every level.
 static int s_ui_fscale = 100;
 static inline lv_coord_t SC(int px) { return (lv_coord_t)((px * s_ui_fscale + 50) / 100); }
+// Popup-card dimension scaler: the 800×480 Tanmatsu panel dwarfs dialogs sized for the
+// 320px T-Deck/V4 — scale their fixed card/menu W/H up so they don't look lost in the middle.
+// No-op (plain SC) on the smaller boards, so their popups stay byte-for-byte unchanged.
+#if defined(HAS_TANMATSU)
+static inline lv_coord_t PSC(int px) { return (lv_coord_t)((SC(px) * 17) / 10); }   // ~1.7×
+#else
+static inline lv_coord_t PSC(int px) { return SC(px); }
+#endif
 #if defined(HAS_TANMATSU)
 static lv_font_t g_font_tab;     // fixed 16 px tab-bar icon font (montserrat_16 + person glyph)
 #endif
@@ -616,12 +625,17 @@ static void v4BuzzerBeep(bool mention) {
 }
 #endif
 
+#if defined(HAS_TANMATSU)
+static void tanBeep();   // I2S notification tick; defined far below (with the CC volume slider)
+#endif
 // Play the platform's notification chime. Caller checks the buzzer/sound pref.
 static inline void uiPlayNotify() {
 #if defined(HAS_TDECK_GT911)
   tdeckPlayNotify(false);
 #elif defined(HELTEC_V4_BUZZER_PIN)
   v4BuzzerBeep(false);
+#elif defined(HAS_TANMATSU)
+  tanBeep();   // I2S codec tick (same path as the volume-preview beep the user confirmed works)
 #endif
 }
 // Play the distinct @-mention chime.
@@ -630,8 +644,20 @@ static inline void uiPlayMention() {
   tdeckPlayNotify(true);
 #elif defined(HELTEC_V4_BUZZER_PIN)
   v4BuzzerBeep(true);
+#elif defined(HAS_TANMATSU)
+  tanBeep();   // no distinct mention chime on the Tanmatsu yet — same tick
 #endif
 }
+
+#if defined(HAS_TANMATSU)
+// Defined in the HAS_TANMATSU apply block far below; forward-declared so the
+// Sound control-center chip (ccSoundCb) can chime through the I2S codec.
+static void tanBeep();
+// Live codec volume (ES8156). Defined far below with the CC volume slider; forward-
+// declared so the Sound settings page (buildDeviceSettings, above it) can apply the
+// volume live as the user adjusts it.
+static void applyVolume(uint8_t pct);
+#endif
 
 // ---- misc UI constants ----
 constexpr int SWIPE_SCROLL_STEP  = 90;
@@ -735,7 +761,11 @@ constexpr int TAB_LAST               = 4;
 
 // ---- Chat overlay layout ----
 constexpr int CHAT_HDR_H       = 0;    // in-chat header bar removed; thread name shows in the status bar
+#if defined(HAS_TANMATSU)
+constexpr int CHAT_COMP_H      = 64;   // big screen: ~2× the typing box (60px) + chrome
+#else
 constexpr int CHAT_COMP_H      = 34;   // composer row, single line (slimmed 50 → 40 → 34; hugs the 30px textbox)
+#endif
 constexpr int CHAT_COMP_MAX_LINES = 4; // composer grows up to this many wrapped lines, then scrolls vertically
 // Current composer-row height. The composer wraps long text to multiple lines
 // and grows UPWARD (its bottom stays pinned, the message list above shrinks)
@@ -843,6 +873,7 @@ struct LvUiState {
   lv_obj_t* tabview;
   lv_obj_t* home_state;
   lv_obj_t* home_unread;   // clickable "envelope + Unread N" line -> Chats inbox
+  lv_obj_t* home_apps;     // "Apps" launcher btn — keyboard-nav default focus on the Home tab
   lv_obj_t* home_stats;
 #if defined(HAS_EXPANSION_KIT)
   lv_obj_t* home_env;        // Expansion-Kit local-env summary label on Home
@@ -1684,7 +1715,7 @@ static void makeSensorsTab(lv_obj_t* tab);
 static void refreshSensorsTab();
 static void refreshSensorsHistoryCharts();
 #endif
-#if defined(HAS_TDECK_KEYBOARD)
+#if defined(HAS_TDECK_KEYBOARD) || defined(HAS_TANMATSU)
 // Keyboard backlight: mode 0=off, 1=on, 2=auto (on while typing, off after idle).
 static uint8_t       s_kb_bl_mode    = 2;
 static unsigned long s_kb_last_key_ms = 0;
@@ -1874,6 +1905,16 @@ static void applyHardwarePanelRotation(uint8_t lvgl_rot) {
   else if (lvgl_rot == LV_DISP_ROT_270) display.setDisplayRotation(3);
 }
 
+// In-chat action openers, forward-declared here UNCONDITIONALLY — their click-callbacks
+// compile on every board — so both those callbacks and the Tanmatsu F-key dispatch can
+// reach them before their definitions further down. (openEmojiPickerForComposer is only
+// used by the Tanmatsu F-keys, so it stays gated.)
+static void openQuickReplyPicker(LvChatPanel* p);       // △ quick replies
+static void openActiveChatSettings();                   // ○ channel settings
+#if defined(HAS_TANMATSU)
+static void openEmojiPickerForComposer(lv_obj_t* ta);   // □ emoji picker (Tanmatsu F-key only)
+#endif
+
 #if defined(HAS_TANMATSU) || defined(HAS_TDECK_TRACKBALL)
 // ===========================================================================
 // Keypad / D-pad focus navigation
@@ -1893,6 +1934,10 @@ static void applyHardwarePanelRotation(uint8_t lvgl_rot) {
 #if defined(HAS_TANMATSU)
 extern "C" {
 #include "bsp/input.h"
+#include "bsp/display.h"     // screen backlight brightness
+#include "bsp/audio.h"       // ES8156 codec volume + speaker amplifier
+#include "driver/i2s_std.h"  // i2s_channel_write — the volume-slider feedback beep
+#include "bsp/tanmatsu.h"            // bsp_tanmatsu_coprocessor_get_handle (pulls tanmatsu_coprocessor.h)
 }
 #endif
 
@@ -1928,6 +1973,19 @@ static lv_obj_t* s_nav_first = nullptr;   // first/last focusable collected each
 static lv_obj_t* s_nav_last  = nullptr;   // arrows jump to these (usually top item / primary action)
 static lv_obj_t* s_nav_entered_obj = nullptr;  // widget Enter was just sent to; if it's a selection
                                                // that didn't navigate away, focus jumps to s_nav_last
+// Where the just-activated element sat, captured at Enter-time (before its cb can destroy it).
+// If Enter rebuilds the screen with FRESH objects (e.g. a control-center chip that recreates the
+// panel), navMaybeRebuild re-focuses the new element at the same spot — keeping the selection on
+// the button you pressed instead of dropping to the top.
+static int  s_nav_resel_x = 0, s_nav_resel_y = 0;
+static bool s_nav_resel_pending = false;
+static inline void navMarkEntered(lv_obj_t* obj) {
+  s_nav_entered_obj = obj;
+  if (obj && lv_obj_is_valid(obj)) {
+    lv_area_t a; lv_obj_get_coords(obj, &a);
+    s_nav_resel_x = (a.x1 + a.x2) / 2; s_nav_resel_y = (a.y1 + a.y2) / 2; s_nav_resel_pending = true;
+  }
+}
 static int       s_nav_count    = 0;           // # focusable widgets collected this rebuild
 // Collected focusable widgets this rebuild, in tree order — used for 2D spatial
 // navigation (W/A/Z/D move to the nearest element in that physical direction, not
@@ -1942,8 +2000,17 @@ static bool      s_nav_show     = true;        // keyboard-only device: focus hi
 #else
 static bool      s_nav_show     = false;       // T-Deck: focus-visible — paint only while keyboard-navigating (hidden after a touch/click)
 #endif
+// While navMaybeRebuild() tears down + recollects the focus group, the FIRST object re-added to the
+// empty group gets auto-focused by LVGL. On a keyboard-only device (s_nav_show always true) that
+// transient focus would scroll the list/chat to that first item (e.g. yank an open chat to the top
+// bubble right after it correctly landed at the bottom). This flag makes navFocusCb skip the
+// scroll-into-view during a rebuild; direct arrow-nav (focus set OUTSIDE a rebuild) still scrolls.
+static bool      s_nav_suppress_scroll = false;
 static void goToTab(int idx);                  // (defined far below) tab switch + refresh
 static int  getActiveTab();                    // (defined below) current tabview index
+#if defined(HAS_TANMATSU)
+static void mapNudge(int dir);                 // (defined far below) Ctrl+Arrow map pan — 0=up 1=down 2=left 3=right
+#endif
 static bool hwKeyDismissTopPopup();            // (defined far below) close the topmost modal/sheet
 static bool anyPopupOpen();                    // (defined below) is any modal/sheet currently up
 static void closeChatPanel(LvChatPanel* p);    // (defined far below) close an open chat/channel detail
@@ -1951,8 +2018,73 @@ static void toggleControlCenter();             // (defined far below) the top-ba
 static void homeKeyActivate();                 // (defined far below) green ○ tap: Home, or toggle drawer if already Home
 static uint32_t s_f4_down_ms = 0;              // green ○ press time — tap = Home, hold = control center
 static uint32_t s_f1_down_ms = 0;              // red ✕ press time — tap = close, hold = power menu
+static uint32_t s_nav_rep_key  = 0;            // arrow key currently held for auto-repeat (0 = none)
+static uint32_t s_nav_rep_t0   = 0;            // when it was pressed
+static uint32_t s_nav_rep_last = 0;            // last auto-repeat fire time
 static bool     s_f1_fired   = false;          // power menu already opened during this F1 hold
 static bool     s_f4_fired   = false;          // control center already opened during this F4 hold
+#if defined(HAS_TANMATSU)
+// The Tanmatsu Vol- (bottom side button) emits NOISY bursts of press/release events per physical
+// press (not one clean edge, and a single tap streams for >0.6 s), so we can't tell a hold from a
+// tap — we just act ONCE per burst, on a "fresh" event after a quiet gap. Single-tap toggle.
+static uint32_t s_vol_last_ev = 0;             // last Vol- event time (any press/release)
+
+// Vol+ (middle side button): a single tap toggles the top-bar dropdown (fired INSTANTLY on the fresh
+// event); a long hold toggles the sound master switch. A tap streams events for a while so we can't
+// defer it — the tap fires immediately, and a detected long-press UNDOES it (toggles the dropdown
+// back) before flipping the sound. Net: a hold leaves the dropdown as it was and just flips sound.
+static uint32_t s_volup_start      = 0;        // 0 = no active burst; else the burst's first-event time
+static uint32_t s_volup_last_ev    = 0;        // last Vol+ event time (burst coalescing)
+static bool     s_volup_long_fired = false;    // long-press (sound) already fired this burst
+static constexpr uint32_t VOLUP_LONG_MS = 1500;  // hold this long (ms) to convert the tap into a sound toggle
+
+// ---- Message-notification LED (the discrete envelope-icon RGB LED on the CH32 coprocessor) --------
+// Hardware (I2C register 146) is on/off per channel for colour A + colour B, plus a `fade` bit that
+// makes the coprocessor autonomously breathe between A and B. There is NO brightness/PWM, so we map:
+//   • unread present  -> breathe OFF<->green (a soft "glow")   byte 0x28 = green_b | fade
+//   • new message     -> solid white, briefly (a bright flash) byte 0x07 = red | green | blue  (colour A)
+//   • idle / disabled -> dark                                  byte 0x00
+// Bit layout: b0 R(A) b1 G(A) b2 B(A) b3 fade b4 R(B) b5 G(B) b6 B(B) b7 fade_hold.
+static uint8_t  s_msgled_last        = 0xFF;   // last byte written (0xFF = unknown -> force the first write)
+static uint32_t s_msgled_flash_until = 0;      // solid-flash one-shot deadline (0 = not flashing)
+
+static void msgLedWriteRaw(uint8_t byte) {
+  if (byte == s_msgled_last) return;           // only hit the I2C bus on a real change
+  tanmatsu_coprocessor_handle_t cph = nullptr;
+  if (bsp_tanmatsu_coprocessor_get_handle(&cph) != ESP_OK || !cph) return;
+  if (tanmatsu_coprocessor_set_message(cph, byte & 0x01, byte & 0x02, byte & 0x04,
+                                            byte & 0x10, byte & 0x20, byte & 0x40,
+                                            byte & 0x08, byte & 0x80) == ESP_OK) {
+    s_msgled_last = byte;
+  }
+}
+
+// Steady state from (feature on?, any unread?). A pending flash overrides until its deadline passes.
+static void msgLedRefresh(bool unread_present) {
+  if (!touchPrefsGetMsgLed()) { msgLedWriteRaw(0x00); return; }                 // feature off -> dark
+  if (s_msgled_flash_until) {
+    if ((int32_t)(millis() - s_msgled_flash_until) < 0) { msgLedWriteRaw(0x07); return; }  // still flashing
+    s_msgled_flash_until = 0;                                                              // flash done
+  }
+  msgLedWriteRaw(unread_present ? 0x28 : 0x00);   // breathe green when unread, else dark
+}
+
+// Kick a one-shot bright flash (a new message just arrived); the steady glow/off resumes after.
+static void msgLedFlash() {
+  if (!touchPrefsGetMsgLed()) return;
+  s_msgled_flash_until = millis() + 220;
+  msgLedWriteRaw(0x07);
+}
+
+static void msgLedToggleCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
+  const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
+  touchPrefsSetMsgLed(on);
+  if (on) msgLedFlash();            // brief confirmation blink
+  else    msgLedWriteRaw(0x00);     // and go dark immediately when turned off
+  if (g_lv.task) g_lv.task->showAlert(on ? TR("Message LED on") : TR("Message LED off"), 900);
+}
+#endif
 
 // The open chat/channel detail is a full-screen overlay on lv_scr_act (above the tabview), so the
 // keypad nav must treat IT as the focus container — else arrows hit the tab bar behind it (switching
@@ -2028,6 +2160,7 @@ static void navUnstyle(lv_obj_t* o) {
     return;
   }
   lv_obj_set_style_outline_width(o, 0, LV_PART_MAIN);
+  lv_obj_set_style_shadow_width(o, 0, LV_PART_MAIN);   // drop the switch/slider focus glow (navFocusCb adds it)
   if (s_nav_sv.bg_c) lv_obj_set_local_style_prop(o, LV_STYLE_BG_COLOR,   s_nav_sv.v_bg_c, LV_PART_MAIN);
   else               lv_obj_remove_local_style_prop(o, LV_STYLE_BG_COLOR,   LV_PART_MAIN);
   if (s_nav_sv.bg_o) lv_obj_set_local_style_prop(o, LV_STYLE_BG_OPA,     s_nav_sv.v_bg_o, LV_PART_MAIN);
@@ -2055,13 +2188,22 @@ static void navFocusCb(lv_group_t* g) {
   if (f && f != s_nav_focus_prev) {   // ignore the transient f==null a rebuild's remove-all emits
     lv_indev_t* act = lv_indev_get_act();   // the indev driving this focus change (null if programmatic)
     const bool by_touch = act && lv_indev_get_type(act) == LV_INDEV_TYPE_POINTER;
+#if defined(HAS_TANMATSU)
+    (void)by_touch;   // no touch; the dedicated arrow keys navigate between fields. A focused field starts in
+    s_nav_ta_editing = false;   // NAVIGATE mode (arrows still move around); the first printable keypress starts editing (keyboard handler below)
+#else
     s_nav_ta_editing = (f != nullptr && (by_touch || f == g_lv.ch.composer_ta || f == g_lv.dm.composer_ta));
+#endif
     s_nav_focus_prev = f;
   }
+  lv_obj_t* nav_was_styled = s_nav_styled;
   if (s_nav_styled && s_nav_styled != f) navUnstyle(s_nav_styled);
   s_nav_styled = nullptr;                  // old highlight (if any) is now restored; nothing styled yet
   if (!f || !s_nav_show) return;          // focus-visible: paint only while actively keyboard-navigating
   s_nav_styled = f;                        // we ARE styling f now — only now does it own s_nav_sv / s_nav_txt
+  if (f == nav_was_styled) return;         // re-focused the SAME already-styled obj: leave its saved style intact.
+                                           // Re-applying would capture the reverse-video AS the "original" so a later
+                                           // navUnstyle restores the highlight → the obj stays stuck highlighted.
   if (f == s_nav_tabbar) {
     // Tab bar is a btnmatrix — invert just the active (checked) tab cell, which tracks
     // the selection as you press left/right, instead of boxing the whole bar.
@@ -2070,12 +2212,19 @@ static void navFocusCb(lv_group_t* g) {
     lv_obj_set_style_text_color(f, lv_color_hex(COLOR_BG), LV_PART_ITEMS | LV_STATE_CHECKED);
   } else if (lv_obj_check_type(f, &lv_switch_class) || lv_obj_check_type(f, &lv_slider_class)) {
     // A switch/slider's look is its knob/indicator, not the MAIN bg, so a reverse-video
-    // fill doesn't read as focused — give it a bright outline instead.
-    s_nav_sv.bg_c = s_nav_sv.bg_o = s_nav_sv.txt = false;   // nothing to restore but the outline
+    // fill doesn't read as focused — give it a bright outline PLUS an accent glow instead.
+    s_nav_sv.bg_c = s_nav_sv.bg_o = s_nav_sv.txt = false;   // nothing to restore but the outline/shadow
+    // Bright white ring tight to the widget…
     lv_obj_set_style_outline_color(f, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
     lv_obj_set_style_outline_width(f, 3, LV_PART_MAIN);
+    lv_obj_set_style_outline_pad(f, 3, LV_PART_MAIN);
     lv_obj_set_style_outline_opa(f, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_outline_pad(f, 2, LV_PART_MAIN);
+    // …backed by a big soft ACCENT glow so a focused switch/slider really pops out
+    // from its neighbours (cleared in navUnstyle alongside the outline).
+    lv_obj_set_style_shadow_color(f, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(f, 16, LV_PART_MAIN);
+    lv_obj_set_style_shadow_spread(f, 2, LV_PART_MAIN);
+    lv_obj_set_style_shadow_opa(f, LV_OPA_COVER, LV_PART_MAIN);
   } else {
     // Save the element's current local props, then apply the negative fill.
     s_nav_sv.bg_c = lv_obj_get_local_style_prop(f, LV_STYLE_BG_COLOR,   &s_nav_sv.v_bg_c, LV_PART_MAIN) == LV_STYLE_RES_FOUND;
@@ -2090,7 +2239,7 @@ static void navFocusCb(lv_group_t* g) {
     uint32_t nc = lv_obj_get_child_cnt(f);
     for (uint32_t i = 0; i < nc; i++) navInvertText(lv_obj_get_child(f, i));
   }
-  lv_obj_scroll_to_view(f, LV_ANIM_OFF);
+  if (!s_nav_suppress_scroll) lv_obj_scroll_to_view(f, LV_ANIM_OFF);
 }
 
 #if defined(HAS_TDECK_TRACKBALL) || defined(HAS_TANMATSU)
@@ -2127,6 +2276,23 @@ static void navMoveDir(int dir) {
   if (n <= 0) return;
   lv_obj_t* cur = lv_group_get_focused(s_nav_group);
   if (!cur || !lv_obj_is_valid(cur)) { s_nav_show = true; lv_group_focus_obj(s_nav_objs[0]); return; }
+  // A focused slider captures LEFT/RIGHT to adjust its VALUE instead of moving focus —
+  // so horizontal tunes the slider and you leave it by going UP/DOWN. (Same idea as the
+  // open-dropdown capture in navPump.) Fire VALUE_CHANGED (live preview) then RELEASED
+  // (commit) so the slider's callbacks behave exactly like a drag+release: brightness
+  // applies + persists, map zoom re-renders + persists, etc.
+  if ((dir == NAV_LEFT || dir == NAV_RIGHT) && lv_obj_check_type(cur, &lv_slider_class)) {
+    const int32_t mn = lv_slider_get_min_value(cur), mx = lv_slider_get_max_value(cur);
+    int32_t step = (mx - mn) / 20; if (step < 1) step = 1;            // ~20 presses end-to-end, min 1
+    int32_t v = lv_slider_get_value(cur) + (dir == NAV_RIGHT ? step : -step);
+    if (v < mn) v = mn; else if (v > mx) v = mx;
+    lv_slider_set_value(cur, v, LV_ANIM_OFF);
+    lv_event_send(cur, LV_EVENT_VALUE_CHANGED, nullptr);
+    lv_event_send(cur, LV_EVENT_RELEASED, nullptr);
+    s_nav_show = true;
+    if (g_lv.task) g_lv.task->noteUserInput();
+    return;
+  }
   lv_area_t a; lv_obj_get_coords(cur, &a);
   const int cx = (a.x1 + a.x2) / 2, cy = (a.y1 + a.y2) / 2;
   lv_obj_t* best = nullptr;
@@ -2322,22 +2488,123 @@ static lv_obj_t* navOpenDropdown() {
 }
 
 #if defined(HAS_TANMATSU)   // bsp-input driven; on the T-Deck navFifo is fed from the trackball instead
+// The UP/DOWN/LEFT/RIGHT action, factored out so a HELD arrow can auto-repeat it (navPump's
+// per-frame tick re-fires this). Recomputes the focused field each call so repeat stays correct.
+static void navArrowAction(uint32_t key) {
+  lv_obj_t* ta_focused = navFocusedTextarea();
+  lv_obj_t* ta = (ta_focused && (!s_kbd_nav || s_nav_ta_editing)) ? ta_focused : nullptr;
+  switch (key) {
+    case BSP_INPUT_NAVIGATION_KEY_UP:    navMoveDir(NAV_UP);   break;   // 2D spatial: element above
+    case BSP_INPUT_NAVIGATION_KEY_DOWN:  navMoveDir(NAV_DOWN); break;   // …below
+    case BSP_INPUT_NAVIGATION_KEY_LEFT:
+      if (ta) lv_textarea_cursor_left(ta);                              // field: move caret
+      else if (navOnTabBar()) navSwitchTab(-1);                         // tab bar: prev screen
+      else navMoveDir(NAV_LEFT);                                        // else: element to the left
+      break;
+    case BSP_INPUT_NAVIGATION_KEY_RIGHT:
+      if (ta) lv_textarea_cursor_right(ta);
+      else if (navOnTabBar()) navSwitchTab(+1);
+      else navMoveDir(NAV_RIGHT);
+      break;
+    default: break;
+  }
+}
+
+// Enter on a focused chat bubble = the same per-message action menu the T-Deck opens on a
+// long-press (Copy / Info / …). Bubbles are the focusable leaves inside the chat's msgs
+// container, so identify one by its parent. Returns true if it handled the Enter.
+static bool navEnterBubble() {
+  lv_obj_t* foc = s_nav_group ? lv_group_get_focused(s_nav_group) : nullptr;
+  LvChatPanel* cp = navOpenChatPanel();
+  if (cp && cp->msgs && foc && lv_obj_is_valid(foc) && lv_obj_get_parent(foc) == cp->msgs) {
+    lv_event_send(foc, LV_EVENT_LONG_PRESSED, nullptr);
+    return true;
+  }
+  return false;
+}
+
 static void navPump() {
   if (!s_nav_queue && (bsp_input_get_queue(&s_nav_queue) != ESP_OK || !s_nav_queue)) return;
   // Fire-on-hold: trigger the F1/F4 long-press action the MOMENT the threshold passes while the
   // key is still held down (not on release), and only once per hold.
   if (s_f1_down_ms && !s_f1_fired && (millis() - s_f1_down_ms) >= 450) { s_f1_fired = true; openPowerMenu(); }
   if (s_f4_down_ms && !s_f4_fired && (millis() - s_f4_down_ms) >= 450) { s_f4_fired = true; toggleControlCenter(); }
+#if defined(HAS_TANMATSU)
+  // Vol+ long-press: once the burst has streamed past the threshold, undo the dropdown the tap opened
+  // and flip the sound master switch instead (fires once mid-hold, like F1/F4 above).
+  if (s_volup_start && !s_volup_long_fired && (millis() - s_volup_start) >= VOLUP_LONG_MS) {
+    s_volup_long_fired = true;
+    toggleControlCenter();                       // undo the tap's instant dropdown toggle
+    if (g_lv.task) {
+      g_lv.task->toggleBuzzer();
+      const bool quiet = g_lv.task->isBuzzerQuiet();
+      if (!quiet) tanBeep();                      // confirmation tick when (re)enabling sound
+      g_lv.task->showAlert(quiet ? TR("Sound off") : TR("Sound on"), 900);
+    }
+  }
+  // Vol+ burst ended (quiet gap since the last event) — close out the press.
+  if (s_volup_start && (millis() - s_volup_last_ev) >= 450) s_volup_start = 0;
+#endif
+  // Auto-repeat a held arrow key: after a short initial delay, re-fire it at a steady rate
+  // (like a PC keyboard) until release — so holding scrolls a list / ramps a slider.
+  if (s_nav_rep_key && (millis() - s_nav_rep_t0) >= 380 && (millis() - s_nav_rep_last) >= 95) {
+    s_nav_rep_last = millis();
+    navArrowAction(s_nav_rep_key);
+  }
   bsp_input_event_t ev;
   int budget = 48;
   while (budget-- > 0 && xQueueReceive(s_nav_queue, &ev, 0) == pdTRUE) {
+#if defined(HAS_TANMATSU)
+    // Vol- (bottom side button): SHORT click = screen sleep/wake (like the V4 user button); LONG press
+    // = lock/unlock (fired mid-hold at the top of navPump). Handle it BEFORE the wake-on-input path so
+    // the press timing isn't swallowed and it never leaks to the UI.
+    // The Tanmatsu BSP emits a redundant SCANCODE event (type 4) — and ACTION (3) for the power
+    // button — alongside every real NAVIGATION/KEYBOARD key. The app only consumes navigation +
+    // keyboard; the duplicate scancode was hitting noteUserInput() and re-waking the screen the
+    // instant a Vol- press slept it. Drop everything that isn't navigation/keyboard.
+    if (ev.type != INPUT_EVENT_TYPE_NAVIGATION && ev.type != INPUT_EVENT_TYPE_KEYBOARD) continue;
+    if (ev.type == INPUT_EVENT_TYPE_NAVIGATION && ev.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_VOLUME_DOWN) {
+      // The button emits a noisy burst per press; act ONCE per burst — on a "fresh" event (>=450 ms
+      // since the last) — and absorb the rest. One tap = one action, instant + reliable. The tap:
+      // locked -> unlock; asleep -> wake; awake -> lock (if "Lock when screen off" is on) else sleep.
+      uint32_t nm = millis();
+      bool fresh = (uint32_t)(nm - s_vol_last_ev) >= 450;
+      s_vol_last_ev = nm;
+      if (fresh && g_lv.task) {
+        if (g_lv.task->isManualLocked())          { g_lv.task->unlockScreen(); }
+        else if (g_lv.task->isScreenOff())        { g_lv.task->wakeScreen();   }
+        else if (touchPrefsGetLockOnScreenOff())  { g_lv.task->lockScreen();   }
+        else                                      { g_lv.task->sleepScreen();  }
+      }
+      continue;
+    }
+    // Vol+ (middle side button): single tap toggles the top-bar dropdown NOW; a long hold converts
+    // that into a sound-master toggle (handled at the top of navPump). Coalesce the noisy burst into
+    // one "tap" on the first fresh event. Screen off -> just wake (Vol- owns wake); locked -> ignore.
+    if (ev.type == INPUT_EVENT_TYPE_NAVIGATION && ev.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_VOLUME_UP) {
+      uint32_t nm = millis();
+      bool fresh = (uint32_t)(nm - s_volup_last_ev) >= 450;
+      s_volup_last_ev = nm;
+      if (fresh && g_lv.task) {
+        if (g_lv.task->isManualLocked())   { s_volup_start = 0; }                          // locked: Vol- unlocks
+        else if (g_lv.task->isScreenOff()) { s_volup_start = 0; g_lv.task->wakeScreen(); }  // off: wake, no gesture
+        else { s_volup_start = nm; s_volup_long_fired = false; toggleControlCenter(); }     // awake: toggle dropdown now
+      }
+      continue;
+    }
+#endif
     // Any key counts as activity: reset the idle timer, and if the screen idled
     // off, wake it and swallow this key (no touch on the Tanmatsu to wake it).
     if (g_lv.task) {
       bool was_off = g_lv.task->isScreenOff();
       g_lv.task->noteUserInput();
+      noteKbActivity();   // physical keypress lights the "auto" keyboard backlight
       if (was_off) continue;
     }
+#if defined(HAS_TANMATSU)
+    // Hard screen lock: the overlay absorbs everything else (Vol- was already handled above).
+    if (g_lv.task && g_lv.task->isManualLocked()) continue;
+#endif
     // An open dropdown captures input: arrows move the highlight (LV_KEY_UP/DOWN, NOT prev/next),
     // Enter selects + closes, Esc/✕ closes. navMaybeRebuild() leaves the group alone while it's open.
     if (navOpenDropdown()) {
@@ -2371,19 +2638,38 @@ static void navPump() {
       const uint32_t mod = ev.args_navigation.modifiers;
       if (s_nav_debug && down) printf("[NAV] navkey=%d mod=%lu ta=%d\n", (int)ev.args_navigation.key, (unsigned long)mod, ta ? 1 : 0);
       switch (ev.args_navigation.key) {
-        case BSP_INPUT_NAVIGATION_KEY_UP:    if (down) navMoveDir(NAV_UP);   break;   // 2D spatial: focus the element above
-        case BSP_INPUT_NAVIGATION_KEY_DOWN:  if (down) navMoveDir(NAV_DOWN); break;   // …below
+        case BSP_INPUT_NAVIGATION_KEY_UP:
+        case BSP_INPUT_NAVIGATION_KEY_DOWN:
         case BSP_INPUT_NAVIGATION_KEY_LEFT:
-          // Field: move caret. Else: focus the element to the LEFT (2D spatial, not just prev-in-list).
-          if (ta) { if (down) lv_textarea_cursor_left(ta); }
-          else if (down && navOnTabBar()) navSwitchTab(-1);
-          else if (down) navMoveDir(NAV_LEFT);
-          break;
         case BSP_INPUT_NAVIGATION_KEY_RIGHT:
-          // Field: move caret. Else: focus the element to the RIGHT (2D spatial).
-          if (ta) { if (down) lv_textarea_cursor_right(ta); }
-          else if (down && navOnTabBar()) navSwitchTab(+1);
-          else if (down) navMoveDir(NAV_RIGHT);
+          // Ctrl+Arrow is an EXPLICIT gesture (not 2D focus nav):
+          //   • On the Map tab  → pan the map one step in that direction.
+          //   • Off the map     → Ctrl+Up/Down page-scroll the focused list/page
+          //                        (Ctrl+Left/Right fall through to normal nav).
+          // No auto-repeat for these (no s_nav_rep_key) — one press = one step/page.
+          if (down && (mod & BSP_INPUT_MODIFIER_CTRL)) {
+            if (getActiveTab() == MAP_TAB_INDEX) {
+              switch (ev.args_navigation.key) {
+                case BSP_INPUT_NAVIGATION_KEY_UP:    mapNudge(0); break;   // north
+                case BSP_INPUT_NAVIGATION_KEY_DOWN:  mapNudge(1); break;   // south
+                case BSP_INPUT_NAVIGATION_KEY_LEFT:  mapNudge(2); break;   // west
+                case BSP_INPUT_NAVIGATION_KEY_RIGHT: mapNudge(3); break;   // east
+                default: break;
+              }
+              break;   // map pan handled — never moves focus / sets repeat
+            }
+            if (ev.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_UP)   { navScrollFocused(true);  break; }
+            if (ev.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_DOWN) { navScrollFocused(false); break; }
+            // Ctrl+Left/Right off the map: fall through to plain 2D nav below.
+          }
+          // Caret / tab-switch / 2D-spatial focus — all in navArrowAction so a held key
+          // auto-repeats (the repeat tick at the top of navPump re-fires the held key).
+          if (down) {
+            s_nav_rep_key = ev.args_navigation.key; s_nav_rep_t0 = s_nav_rep_last = millis();
+            navArrowAction(ev.args_navigation.key);
+          } else if (s_nav_rep_key == ev.args_navigation.key) {
+            s_nav_rep_key = 0;   // released → stop repeating
+          }
           break;
         case BSP_INPUT_NAVIGATION_KEY_TAB:   navFifoPush((mod & BSP_INPUT_MODIFIER_SHIFT) ? LV_KEY_PREV : LV_KEY_NEXT, down); break;
         case BSP_INPUT_NAVIGATION_KEY_RETURN:
@@ -2397,7 +2683,8 @@ static void navPump() {
           }
           if (s_nav_debug && down) printf("[NAV] ENTER focus=%p unread=%p first=%p last=%p tabbar=%p\n",
             (void*)lv_group_get_focused(s_nav_group), (void*)g_lv.home_unread, (void*)s_nav_first, (void*)s_nav_last, (void*)s_nav_tabbar);
-          if (!ta && down) s_nav_entered_obj = lv_group_get_focused(s_nav_group);
+          if (!ta && down) navMarkEntered(lv_group_get_focused(s_nav_group));
+          if (!ta && down && navEnterBubble()) break;   // Enter on a chat bubble = the long-press menu
           navFifoPush(ta ? LV_KEY_NEXT : LV_KEY_ENTER, down); break;   // on a field, Enter advances
         case BSP_INPUT_NAVIGATION_KEY_F1:    // red ✕ — tap = close topmost; HOLD = power menu (opens mid-hold, see navPump top)
           if (down) { if (!s_f1_down_ms) { s_f1_down_ms = millis(); s_f1_fired = false; } break; }
@@ -2415,17 +2702,32 @@ static void navPump() {
           if (anyPopupOpen()) { if (down) hwKeyDismissTopPopup(); break; }   // else the topmost modal/sheet
           navFifoPush(LV_KEY_ESC, down);
           break;
-        // Coloured shape keys → jump to a main page (left→right F2..F6 = △ □ ○ ♣ ◇).
-        case BSP_INPUT_NAVIGATION_KEY_F2: if (down) navGoToMainTab(CHAT_INBOX_TAB_INDEX); break;  // orange △ = Messages
-        case BSP_INPUT_NAVIGATION_KEY_F3: if (down) navGoToMainTab(CONTACTS_TAB_INDEX);   break;  // yellow □ = Contacts
-        case BSP_INPUT_NAVIGATION_KEY_F4:                                                         // green ○ — tap=Home, hold=control center
+        // Coloured shape keys (left→right F2..F6 = △ □ ○ ♣ ◇). On a MAIN page they jump
+        // to that tab; INSIDE a chat/channel they become the in-conversation controls
+        // that match the on-screen coloured-shape chips (see makeChatDetail).
+        case BSP_INPUT_NAVIGATION_KEY_F2:                                                         // orange △ — chat: quick replies; else Messages
+          if (down) { LvChatPanel* cp = navOpenChatPanel();
+                      if (cp) openQuickReplyPicker(cp); else navGoToMainTab(CHAT_INBOX_TAB_INDEX); }
+          break;
+        case BSP_INPUT_NAVIGATION_KEY_F3:                                                         // yellow □ — chat: emoji picker; else Contacts
+          if (down) { LvChatPanel* cp = navOpenChatPanel();
+                      if (cp) openEmojiPickerForComposer(cp->composer_ta); else navGoToMainTab(CONTACTS_TAB_INDEX); }
+          break;
+        case BSP_INPUT_NAVIGATION_KEY_F4: {                                                       // green ○ — channel chat: settings; else Home/control center
+          LvChatPanel* cp = navOpenChatPanel();
+          if (cp && cp->channel_mode) { if (down) openActiveChatSettings(); break; }
           if (down) { if (!s_f4_down_ms) { s_f4_down_ms = millis(); s_f4_fired = false; } }
           else { const bool fired = s_f4_fired; s_f4_down_ms = 0; s_f4_fired = false;
                  if (!fired) homeKeyActivate();   // tap: Home / toggle app drawer (control center already opened mid-hold if held)
                }
           break;
+        }
         case BSP_INPUT_NAVIGATION_KEY_F5: if (down) navGoToMainTab(MAP_TAB_INDEX);        break;  // blue ♣ = Map
-        case BSP_INPUT_NAVIGATION_KEY_F6: if (down) navGoToMainTab(SETTINGS_TAB_INDEX);   break;  // purple ◇ = Settings
+        case BSP_INPUT_NAVIGATION_KEY_F6:                                                         // purple ◇ — chat: jump to latest; else Settings
+          if (down) { LvChatPanel* cp = navOpenChatPanel();
+                      if (cp) { if (cp->msgs) lv_obj_scroll_to_y(cp->msgs, LV_COORD_MAX, LV_ANIM_ON); }
+                      else navGoToMainTab(SETTINGS_TAB_INDEX); }
+          break;
         default: break;
       }
     } else if (ev.type == INPUT_EVENT_TYPE_KEYBOARD) {
@@ -2442,10 +2744,18 @@ static void navPump() {
           else navPushTap(LV_KEY_NEXT);
         }
         else if ((uint8_t)c >= 32)       lv_textarea_add_char(ta, (uint32_t)(uint8_t)c);
+#if defined(HAS_TANMATSU)
+      } else if (ta_focused && (uint8_t)c >= 32) {
+        // Tanmatsu: a printable keypress on a focused (not-yet-editing) field starts editing AND types
+        // that character — no Enter first. The dedicated arrow keys still navigate between fields until
+        // you type, and ←/→ then move the caret (navArrowAction) once editing.
+        s_nav_ta_editing = true;
+        lv_textarea_add_char(ta_focused, (uint32_t)(uint8_t)c);
+#endif
       } else if (c == '\r' || c == '\n' || c == ' ') {   // Enter / space = select — ALWAYS works (independent of the letter binds)
         if (ta_focused) s_nav_ta_editing = true;         // on a focused field, select starts typing (letters navigate until then)
         else if (navOnTabBar()) navSwitchTab(+1);
-        else { s_nav_entered_obj = lv_group_get_focused(s_nav_group); navPushTap(LV_KEY_ENTER); }
+        else { navMarkEntered(lv_group_get_focused(s_nav_group)); if (!navEnterBubble()) navPushTap(LV_KEY_ENTER); }
       } else if (c == 8 || c == 127) {                    // Backspace = back — ALWAYS works
         if (anyPopupOpen()) hwKeyDismissTopPopup(); else navPushTap(LV_KEY_ESC);
       } else switch (navDirForKey(c)) {        // programmable letter nav — Tanmatsu defaults W up/A left/X down/D right/S select, F/V scroll
@@ -2455,7 +2765,7 @@ static void navPump() {
         case 3: if (navOnTabBar()) navSwitchTab(+1); else navMoveDir(NAV_RIGHT); break;     // right → element to the right
         case 4: if (navOnTabBar()) navSwitchTab(+1);                                        // select
                 else if (ta_focused) s_nav_ta_editing = true;                               // focused field: start typing
-                else { s_nav_entered_obj = lv_group_get_focused(s_nav_group); navPushTap(LV_KEY_ENTER); } break;
+                else { navMarkEntered(lv_group_get_focused(s_nav_group)); if (!navEnterBubble()) navPushTap(LV_KEY_ENTER); } break;
         case 5: if (anyPopupOpen()) hwKeyDismissTopPopup(); else navPushTap(LV_KEY_ESC); break;  // back (unbound by default on Tanmatsu)
         case 6: navScrollFocused(true);  break;                                             // scroll up
         case 7: navScrollFocused(false); break;                                             // scroll down
@@ -2565,6 +2875,7 @@ static void navMaybeRebuild() {
   // list would snap to the top. Stash the page focus on the way out, restore it on the way back.
   static lv_obj_t* s_nav_page_focus = nullptr;
   static bool s_nav_prev_on_page = true;
+  static bool s_nav_prev_useTop  = false;   // track the container kind so reselect only fires on a same-screen rebuild
   lv_obj_t* scr = lv_scr_act();
   lv_obj_t* top = lv_layer_top();
   bool useTop = navTopHasVisibleChild(top);
@@ -2589,6 +2900,7 @@ static void navMaybeRebuild() {
   s_nav_dirty = false; s_nav_prev_scr = scr; s_nav_prev_sig = sig;
   lv_obj_t* keep = lv_group_get_focused(s_nav_group);     // preserve focus across a same-page rebuild (toggle/click)
   if (!on_page && s_nav_prev_on_page) s_nav_page_focus = keep;   // #45: leaving the page → remember where we were
+  s_nav_suppress_scroll = true;   // don't let the transient first-object focus during recollect scroll the page/chat
   lv_group_remove_all_objs(s_nav_group);
   s_nav_first = s_nav_last = nullptr; s_nav_count = 0;
   if (root) navCollect(root);                              // content items (focus starts here)
@@ -2602,21 +2914,49 @@ static void navMaybeRebuild() {
   s_nav_want_tabbar = false;
   // When a chat just opened, drop focus on its composer so typing goes straight in (issue: textfield
   // not auto-selected). Only on the open transition, so new messages don't steal focus mid-typing.
+  bool focus_set = false;   // true once we deliberately focus a COLLECTED obj (else LVGL defaults to the first item)
   if (chat && chat != s_nav_prev_chat && chat->composer_ta && lv_obj_is_valid(chat->composer_ta)) {
     lv_group_focus_obj(chat->composer_ta);   // chat just opened → focus the composer
+    focus_set = true;
   } else if (on_page && !s_nav_prev_on_page && s_nav_page_focus && lv_obj_is_valid(s_nav_page_focus)) {
     // #45: just returned to the page from an overlay/chat — restore the item we left from so the
     // list stays put instead of snapping to the top.
     const int n = s_nav_count < kNavMax ? s_nav_count : kNavMax;
-    for (int i = 0; i < n; i++) if (s_nav_objs[i] == s_nav_page_focus) { lv_group_focus_obj(s_nav_page_focus); break; }
+    for (int i = 0; i < n; i++) if (s_nav_objs[i] == s_nav_page_focus) { lv_group_focus_obj(s_nav_page_focus); focus_set = true; break; }
   } else if (keep && lv_obj_is_valid(keep)) {
     // A toggle/click triggers a rebuild; if the previously-focused element survived,
     // keep focus on it instead of jumping back to the top of the page.
     const int n = s_nav_count < kNavMax ? s_nav_count : kNavMax;
-    for (int i = 0; i < n; i++) if (s_nav_objs[i] == keep) { lv_group_focus_obj(keep); break; }
+    for (int i = 0; i < n; i++) if (s_nav_objs[i] == keep) { lv_group_focus_obj(keep); focus_set = true; break; }
+  } else if (s_nav_resel_pending && useTop == s_nav_prev_useTop && chat == s_nav_prev_chat &&
+             on_page == s_nav_prev_on_page) {
+    // The activated element was rebuilt as a FRESH object on the same screen (e.g. a control-
+    // center chip that recreates the whole panel) — re-focus whichever new element sits where
+    // the old one was, so the selection stays on the button you just pressed.
+    long best = 0x7FFFFFFFL; lv_obj_t* bo = nullptr;
+    const int n = s_nav_count < kNavMax ? s_nav_count : kNavMax;
+    for (int i = 0; i < n; i++) {
+      lv_obj_t* o = s_nav_objs[i]; if (!o) continue;
+      lv_area_t b; lv_obj_get_coords(o, &b);
+      long dx = (long)((b.x1 + b.x2) / 2) - s_nav_resel_x, dy = (long)((b.y1 + b.y2) / 2) - s_nav_resel_y;
+      long d = dx * dx + dy * dy;
+      if (d < best) { best = d; bo = o; }
+    }
+    if (bo && best <= 40 * 40) { s_nav_show = true; lv_group_focus_obj(bo); focus_set = true; }   // only a genuine overlap (recreated)
   }
+  // Home tab, FRESH focus (none of the keep/restore/reselect branches actually set focus): default
+  // to the "Apps" button instead of letting LVGL fall to the first collected item (the unread line).
+  // Guarded so returning from a sub-page (which restores the prior selection above) is NOT overridden.
+  if (!focus_set && on_page && getActiveTab() == HOME_TAB_INDEX &&
+      g_lv.home_apps && lv_obj_is_valid(g_lv.home_apps)) {
+    const int n = s_nav_count < kNavMax ? s_nav_count : kNavMax;
+    for (int i = 0; i < n; i++) if (s_nav_objs[i] == g_lv.home_apps) { lv_group_focus_obj(g_lv.home_apps); break; }
+  }
+  s_nav_suppress_scroll = false;   // real focus is set — re-enable focus-scroll for live arrow navigation
+  s_nav_resel_pending = false;   // consumed this rebuild
   s_nav_prev_chat = chat;
   s_nav_prev_on_page = on_page;   // #45
+  s_nav_prev_useTop  = useTop;     // for the same-screen reselect guard above
   if (s_nav_debug) printf("[NAV] rebuilt count=%d %s tab=%d\n", s_nav_count, useTop ? "top" : chat ? "chat" : "tab", getActiveTab());
 }
 
@@ -4502,11 +4842,19 @@ static void openThreadActionSheet(int thread_idx, const char* name, bool is_chan
   lv_obj_move_foreground(s_channel_long_sheet);
   lv_obj_add_event_cb(s_channel_long_sheet, channelLongSheetDismissCb, LV_EVENT_CLICKED, nullptr);
 
+  // Enlarged on the big Tanmatsu panel so this long-press sheet doesn't look lost
+  // (PSC is a no-op on the smaller boards, so they're unchanged).
+#if defined(HAS_TANMATSU)
+  const int card_w = PSC(220);
+  const int btn_h = PSC(42);
+  const int pad = PSC(10);
+#else
   const int card_w = 220;
   const int btn_h = 42;
   const int pad = 10;
+#endif
   const int rows = is_channel ? 5 : 2;   // mark-read + (mute-msg/mute-men/share/remove | delete)
-  int card_h = 36 + rows * (btn_h + 6) + pad;
+  int card_h = PSC(36) + rows * (btn_h + PSC(6)) + pad;
   const int max_h = lv_disp_get_ver_res(nullptr) - STATUSBAR_H - 12;
   const bool card_scroll = (card_h > max_h);
   if (card_scroll) card_h = max_h;
@@ -4541,8 +4889,8 @@ static void openThreadActionSheet(int thread_idx, const char* name, bool is_chan
   // top-right) is never drawn on top of a button as the list scrolls.
   lv_obj_t* body = lv_obj_create(card);
   lv_obj_remove_style_all(body);
-  lv_obj_set_pos(body, 0, 28);
-  lv_obj_set_size(body, card_w - 2 * pad, card_h - 2 * pad - 28);
+  lv_obj_set_pos(body, 0, PSC(28));
+  lv_obj_set_size(body, card_w - 2 * pad, card_h - 2 * pad - PSC(28));
   lv_obj_set_style_pad_all(body, 0, LV_PART_MAIN);
   if (card_scroll) lv_obj_set_scroll_dir(body, LV_DIR_VER);
   else             lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
@@ -4558,7 +4906,7 @@ static void openThreadActionSheet(int thread_idx, const char* name, bool is_chan
     lv_obj_t* l = lv_label_create(b);
     lv_label_set_text(l, lbl);
     lv_obj_center(l);
-    y += btn_h + 6;
+    y += btn_h + PSC(6);
     return b;
   };
   mk(LV_SYMBOL_OK "  Mark as read", threadSheetMarkReadCb, 0);
@@ -4646,13 +4994,16 @@ static void threadSelectCb(lv_event_t* e) {
     copyUtf8ReplacingMissingGlyphs(&g_font_12, san, sizeof(san), name);
     setChatStatusTitle(san);   // thread name → status bar (no in-chat header bar)
   }
-  refreshChatDetail(p);
   p.detail_open = true;
   hideKb();
   if (p.overlay) {
     lv_obj_clear_flag(p.overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(p.overlay);
   }
+  // Build + scroll AFTER un-hiding: bubbles measured in a hidden tree get a wrong height,
+  // which collapses the content so the open-scroll lands at the top. Visible first = correct
+  // heights = the open-scroll reaches the newest message.
+  refreshChatDetail(p);
 #if defined(HAS_TDECK_KEYBOARD)
   // Physical keyboard: focus the composer on open so typing goes straight in.
   showKb(&p);
@@ -4912,20 +5263,46 @@ static void openEmojiPicker(lv_obj_t* ta, const char* const* items = k_emoji_ite
   lv_obj_set_scroll_dir(grid, LV_DIR_VER);
   lv_obj_set_scrollbar_mode(grid, LV_SCROLLBAR_MODE_AUTO);
   s_emoji_grid = grid;
+  // Emoji cells render the baked colour glyph as a ZOOMED image (70% bigger than the 16 px
+  // font glyph) and get a bigger cell; special-character cells stay text labels.
+#if defined(HAS_TANMATSU)
+  const bool      big_emoji = (s_glyph_items == k_emoji_items);
+  const lv_coord_t cell_px  = big_emoji ? 48 : 38;
+#else
+  const lv_coord_t cell_px  = 38;
+#endif
   // Column count for the trackball selector's row jumps: floor((w + gap) /
-  // (btn + gap)) with btn=38, gap=4. Matches the flex-wrap that LVGL computes.
-  s_emoji_cols = (int)((grid_w + 4) / (38 + 4));
+  // (cell + gap)), gap=4. Matches the flex-wrap that LVGL computes.
+  s_emoji_cols = (int)((grid_w + 4) / (cell_px + 4));
   if (s_emoji_cols < 1) s_emoji_cols = 1;
   s_emoji_sel = -1;   // start un-highlighted; first roll selects index 0
   s_emoji_acc_x = s_emoji_acc_y = 0;
 
   for (int i = 0; i < s_glyph_count; ++i) {
     lv_obj_t* b = lv_btn_create(grid);
-    lv_obj_set_size(b, 38, 38);
+    lv_obj_set_size(b, cell_px, cell_px);
     styleButton(b);
     lv_obj_set_style_bg_color(b, lv_color_hex(0x1A1B1C), LV_PART_MAIN);
     lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);
     lv_obj_add_event_cb(b, emojiPickCb, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+#if defined(HAS_TANMATSU) && LV_USE_IMGFONT
+    // Baked colour-emoji → draw it as a zoomed image (1.7× ≈ 70% bigger than the 16 px
+    // font glyph). Special chars (no emoji dsc) fall through to the text label below.
+    if (big_emoji) {
+      uint32_t goff = 0;
+      const lv_img_dsc_t* ed = emojiGlyphLookup(_lv_txt_encoded_next(s_glyph_items[i], &goff));
+      if (ed) {
+        lv_obj_t* im = lv_img_create(b);
+        lv_img_set_src(im, ed);
+        lv_img_set_antialias(im, true);
+        if (ed->header.w && ed->header.h)
+          lv_img_set_pivot(im, ed->header.w / 2, ed->header.h / 2);
+        lv_img_set_zoom(im, 435);              // 256 = 1×, 435 ≈ 1.7×
+        lv_obj_center(im);
+        continue;
+      }
+    }
+#endif
     lv_obj_t* l = lv_label_create(b);
     lv_label_set_text(l, s_glyph_items[i]);
     lv_obj_set_style_text_font(l, &g_font_16, LV_PART_MAIN);
@@ -4946,6 +5323,11 @@ static void openEmojiPickerCb(lv_event_t* e) {
   if (!p || !p->composer_ta) return;
   openEmojiPicker(p->composer_ta);
 }
+#if defined(HAS_TANMATSU)
+// Thin wrapper so navPump's yellow F3 key can open the emoji picker for a composer without
+// openEmojiPicker's default args having to be visible up there.
+static void openEmojiPickerForComposer(lv_obj_t* ta) { if (ta) openEmojiPicker(ta); }
+#endif
 
 static void closeQuickReplySheet() {
   if (s_qr_sheet) {
@@ -4984,8 +5366,12 @@ static void qrSheetCloseCb(lv_event_t* e) {
 }
 
 static void openQuickReplyPickerCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-  auto* p = static_cast<LvChatPanel*>(lv_event_get_user_data(e));
+  if (lv_event_get_code(e) == LV_EVENT_CLICKED)
+    openQuickReplyPicker(static_cast<LvChatPanel*>(lv_event_get_user_data(e)));
+}
+// Build + show the quick-reply (macro) picker for a chat panel. Shared by the composer's
+// △ chip tap (openQuickReplyPickerCb) and the orange F2 hardware key on the Tanmatsu.
+static void openQuickReplyPicker(LvChatPanel* p) {
   if (!p) return;
   closeQuickReplySheet();
   s_qr_panel = p;
@@ -5003,12 +5389,23 @@ static void openQuickReplyPickerCb(lv_event_t* e) {
   lv_obj_clear_flag(s_qr_sheet, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_qr_sheet, qrSheetCloseCb, LV_EVENT_CLICKED, nullptr);
 
+  // Bigger on the 800-px Tanmatsu panel; unchanged on the smaller boards.
+#if defined(HAS_TANMATSU)
+  const int card_w = PSC(220);
+  const int btn_h  = PSC(32);
+  const int pad    = PSC(8);
+  const int title_h = PSC(26);
+  const int hint_h  = PSC(22);
+  const int row_gap = PSC(4);
+#else
   const int card_w = 220;
   const int btn_h  = 32;          // 34→32: 6 macro rows have to fit in the
   const int pad    = 8;           // visible area (298 px) below the status
   const int title_h = 26;         // bar — the old sizing produced a 302 px
   const int hint_h  = 22;         // card that clipped behind the bar.
-  const int card_h = title_h + TOUCH_QUICK_REPLY_COUNT * (btn_h + 4) + hint_h + pad;
+  const int row_gap = 4;
+#endif
+  const int card_h = title_h + TOUCH_QUICK_REPLY_COUNT * (btn_h + row_gap) + hint_h + pad;
   lv_obj_t* card = lv_obj_create(s_qr_sheet);
   lv_obj_remove_style_all(card);
   lv_obj_set_size(card, card_w, card_h);
@@ -5047,7 +5444,7 @@ static void openQuickReplyPickerCb(lv_event_t* e) {
     lv_obj_set_style_text_font(lbl, &g_font_12, LV_PART_MAIN);
     lv_obj_set_style_text_color(lbl, lv_color_hex(n > 0 ? COLOR_TEXT : COLOR_SUB), LV_PART_MAIN);
     lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 8, 0);
-    y += btn_h + 4;   // match the 4-px gap used in card_h calc above
+    y += btn_h + row_gap;   // match the gap used in card_h calc above
   }
 #endif
   lv_obj_t* hint = lv_label_create(card);
@@ -5214,28 +5611,42 @@ static void toggleBuzzerCb(lv_event_t* e) {   // message-sound switch (VALUE_CHA
   g_lv.task->toggleBuzzer();
   const bool quiet = g_lv.task->isBuzzerQuiet();
   g_lv.task->showAlert(quiet ? TR("Sound off") : TR("Sound on"), 900);
-#if defined(HAS_UI_SOUND)
+#if defined(HAS_TANMATSU)
+  if (!quiet) tanBeep();        // confirmation tick through the I2S codec
+#elif defined(HAS_UI_SOUND)
   if (!quiet) uiPlayNotify();   // confirmation chime when enabling
 #endif
   refreshStatusLabels();
 }
 
-#if defined(HAS_UI_SOUND)
+#if defined(HAS_UI_SOUND) || defined(HAS_TANMATSU)
+// Platform notify preview (codec tick on the Tanmatsu, buzzer chime elsewhere).
+static inline void uiSoundPreview() {
+#if defined(HAS_TANMATSU)
+  tanBeep();
+#else
+  uiPlayNotify();
+#endif
+}
 // Message-sound switch (under the master Sound switch). VALUE_CHANGED; previews.
 static void toggleMessageSoundCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
   touchPrefsSetSoundMessages(on);
-  if (on) uiPlayNotify();
+  if (on) uiSoundPreview();
 }
 // @-mention-sound switch (distinct chime; lets you keep mentions on with messages off).
 static void toggleMentionSoundCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
   const bool on = lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED);
   touchPrefsSetSoundMentions(on);
+#if defined(HAS_TANMATSU)
+  if (on) tanBeep();          // the Tanmatsu has no distinct mention chime — same tick
+#else
   if (on) uiPlayMention();
+#endif
 }
-#if defined(HAS_TDECK_GT911)
+#if defined(HAS_TDECK_GT911) || defined(HAS_TANMATSU)
 // Volume +/- step buttons (user_data = step, e.g. +10 / -10). Clamps 0..100,
 // updates the readout, previews. Simpler + more reliable than a drag slider.
 static lv_obj_t* s_vol_val_lbl = nullptr;
@@ -5245,7 +5656,12 @@ static void volumeStepCb(lv_event_t* e) {
   if (v < 0) v = 0; if (v > 100) v = 100;
   touchPrefsSetSoundVolume((uint8_t)v);
   if (s_vol_val_lbl) lv_label_set_text_fmt(s_vol_val_lbl, "%d%%", v);
+#if defined(HAS_TANMATSU)
+  applyVolume((uint8_t)v);    // push the new level to the codec live, then preview it
+  tanBeep();
+#else
   uiPlayNotify();   // preview at the new volume
+#endif
 }
 #endif
 #endif
@@ -5856,6 +6272,12 @@ static void saveRadioParamsCb(lv_event_t* e) {
     g_lv.task->showAlert(TR("Invalid radio values"), 1200);
     return;
   }
+  if (tx > (int)MAX_LORA_TX_POWER) {   // radio can't exceed this — clamp + notify (else it appears to "reset" to the max on reboot)
+    tx = (int)MAX_LORA_TX_POWER;
+    char m[40]; snprintf(m, sizeof m, "TX max is %d dBm", tx);
+    g_lv.task->showAlert(m, 1500);
+    if (g_set_modal.tx_ta) { char v[8]; snprintf(v, sizeof v, "%d", tx); lv_textarea_set_text(g_set_modal.tx_ta, v); }   // reflect the clamp in the field
+  }
   bool ok = g_lv.task->setRadioParams(freq, bw, static_cast<uint8_t>(sf), static_cast<uint8_t>(cr),
                                       static_cast<int8_t>(tx), af);
   // Region scope — independent of the freq/SF values above. Derive + persist the
@@ -6123,10 +6545,14 @@ static void openDiscoveredSettingsSheetCb(lv_event_t* e) {
   lv_obj_move_foreground(s_disc_settings_root);
   lv_obj_add_event_cb(s_disc_settings_root, discSettingsDismissCb, LV_EVENT_CLICKED, nullptr);
 
+#if defined(HAS_TANMATSU)
+  const int card_w = PSC(220);
+#else
   const int card_w = 220;
+#endif
   lv_obj_t* card = lv_obj_create(s_disc_settings_root);
   lv_obj_remove_style_all(card);
-  lv_obj_set_size(card, card_w, SC(188));
+  lv_obj_set_size(card, card_w, PSC(188));
   lv_obj_align(card, LV_ALIGN_CENTER, 0, -46);   // shifted up so the keyboard clears the hop field
   lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_PANEL), LV_PART_MAIN);
   lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
@@ -7437,6 +7863,8 @@ static void lockOnScreenOffToggleCb(lv_event_t* e) {
   s_lock_on_screen_off = on;
 #if defined(HAS_TDECK_GT911)
   const char* unlock_hint = on ? TR("Locks when screen off\n(hold the trackball to unlock)") : TR("Screen-off just dims");
+#elif defined(HAS_TANMATSU)
+  const char* unlock_hint = on ? TR("Locks when screen off\n(press Volume Down to unlock)") : TR("Screen-off just dims");
 #else
   const char* unlock_hint = on ? TR("Locks when screen off\n(press the button to unlock)") : TR("Screen-off just dims");
 #endif
@@ -7883,7 +8311,7 @@ static void openExpansionCard() {
   lv_obj_clear_flag(s_expansion_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_expansion_root, expansionBackdropCb, LV_EVENT_CLICKED, nullptr);
 
-  const lv_coord_t card_w = LV_MIN(sw - 16, 224);
+  const lv_coord_t card_w = LV_MIN(sw - 16, (lv_coord_t)PSC(224));   // wider cap on the Tanmatsu
   lv_obj_t* card = lv_obj_create(s_expansion_root);
   lv_obj_remove_style_all(card);
   lv_obj_set_size(card, card_w, LV_SIZE_CONTENT);
@@ -7910,19 +8338,19 @@ static void openExpansionCard() {
   lv_label_set_text(lbl, info[0] ? info : TR("No local expansion data"));
   lv_obj_set_style_text_font(lbl, &g_font_12, LV_PART_MAIN);
   lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
-  lv_obj_set_pos(lbl, 0, 28);
+  lv_obj_set_pos(lbl, 0, PSC(28));
   lv_obj_update_layout(lbl);
 
   lv_obj_t* d = lv_btn_create(card);
-  lv_obj_set_size(d, card_w - 20, 34);
-  lv_obj_set_pos(d, 0, 36 + lv_obj_get_height(lbl));
+  lv_obj_set_size(d, card_w - 20, PSC(34));
+  lv_obj_set_pos(d, 0, PSC(36) + lv_obj_get_height(lbl));
   styleButton(d);
   lv_obj_add_event_cb(d, openLocalSensorsPageCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* dl = lv_label_create(d);
   lv_label_set_text(dl, TR("Detailed sensors"));
   lv_obj_center(dl);
 
-  lv_obj_set_height(card, 44 + lv_obj_get_height(lbl) + 42);
+  lv_obj_set_height(card, PSC(44) + lv_obj_get_height(lbl) + PSC(42));
   lv_obj_move_foreground(s_expansion_root);
 }
 
@@ -8046,8 +8474,9 @@ static void buildDeviceSettings(int sec) {
   }
 
   if (sec == DSEC_SOUND) {   // --- Sound ---
-  // Sound toggle — T-Deck I2S speaker or Heltec V4 expansion-kit piezo buzzer.
-#if defined(HAS_UI_SOUND)
+  // Sound toggle — T-Deck I2S speaker, Heltec V4 expansion-kit piezo buzzer, or
+  // the Tanmatsu's ES8156 codec / speaker amp.
+#if defined(HAS_UI_SOUND) || defined(HAS_TANMATSU)
   // Master Sound switch — off overrules everything (fully silent).
   {
     int rh = settingsRowLabel(body, y, 6, "Sound", COLOR_SUB, nullptr, 56);
@@ -8075,8 +8504,8 @@ static void buildDeviceSettings(int sec) {
     lv_obj_add_event_cb(sw, toggleMentionSoundCb, LV_EVENT_VALUE_CHANGED, nullptr);
     y += LV_MAX(34, rh + 12);
   }
-#if defined(HAS_TDECK_GT911)
-  // Volume with - / + step buttons (T-Deck I2S; the V4 piezo can't vary volume).
+#if defined(HAS_TDECK_GT911) || defined(HAS_TANMATSU)
+  // Volume with - / + step buttons (T-Deck I2S + Tanmatsu codec; the V4 piezo can't vary volume).
   {
     lv_obj_t* vl = lv_label_create(body);
     lv_label_set_text(vl, TR("Volume"));
@@ -8173,6 +8602,16 @@ static void buildDeviceSettings(int sec) {
     lv_obj_set_pos(dd, 2, y);
     lv_obj_add_event_cb(dd, uiScaleSelectCb, LV_EVENT_VALUE_CHANGED, nullptr);
     y += SC(44);
+  }
+  /* Message LED: flash the envelope-icon LED on a new message and softly breathe it while there
+     are unread messages. Turn off to keep that LED dark. (Tanmatsu only — the others have no such LED.) */
+  {
+    int h = settingsRowLabel(body, y, 6, "Message LED", COLOR_SUB, nullptr, 56);
+    lv_obj_t* sw = lv_switch_create(body);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
+    if (touchPrefsGetMsgLed()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_add_event_cb(sw, msgLedToggleCb, LV_EVENT_VALUE_CHANGED, nullptr);
+    y += LV_MAX(40, h + 12);
   }
 #endif
 
@@ -8543,6 +8982,7 @@ static void buildDeviceSettings(int sec) {
     }
     lv_label_set_long_mode(s_lockwall_btn_lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_width(s_lockwall_btn_lbl, lv_pct(92));
+    lv_obj_set_style_text_align(s_lockwall_btn_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);  // centre text within the fixed-width label
     lv_obj_center(s_lockwall_btn_lbl);
     y += SC(40);
 
@@ -8598,6 +9038,7 @@ static void buildDeviceSettings(int sec) {
     lv_label_set_text(s_tz_btn_lbl, touchPrefsTimezoneLabel(touchPrefsGetTimezone()));
     lv_label_set_long_mode(s_tz_btn_lbl, LV_LABEL_LONG_DOT);
     lv_obj_set_width(s_tz_btn_lbl, lv_pct(92));
+    lv_obj_set_style_text_align(s_tz_btn_lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);  // centre text within the fixed-width label
     lv_obj_center(s_tz_btn_lbl);
     y += SC(42);
   }
@@ -8924,12 +9365,12 @@ static void showConfirm(const char* msg, const char* ok_label, SimpleCb on_confi
   // Card
   lv_obj_t* card = lv_obj_create(s_confirm_modal);
   lv_obj_remove_style_all(card);
-  lv_obj_set_size(card, SC(210), SC(160));
+  lv_obj_set_size(card, PSC(210), PSC(160));
   lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
   styleSurface(card, COLOR_PANEL, 12);
   lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
   lv_obj_set_style_border_color(card, lv_color_hex(0x18191A), LV_PART_MAIN);
-  lv_obj_set_style_pad_all(card, 12, LV_PART_MAIN);
+  lv_obj_set_style_pad_all(card, PSC(12), LV_PART_MAIN);
   lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
   addCloseXBadge(card, confirmCancelEvt);   // X behaves like Cancel
 
@@ -8938,14 +9379,18 @@ static void showConfirm(const char* msg, const char* ok_label, SimpleCb on_confi
   // Shrink width so the first line doesn't slide under the top-right X.
   // Push the label down 4 px so the X glyph and the start of the text
   // baseline don't touch optically.
+#if defined(HAS_TANMATSU)
+  lv_obj_set_width(lbl, PSC(186 - 32));
+#else
   lv_obj_set_width(lbl, 186 - 32);
+#endif
   lv_label_set_text(lbl, TR(msg));
   lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_set_style_text_font(lbl, &g_font_14, LV_PART_MAIN);
   lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 0, 0);
 
   lv_obj_t* b_cancel = lv_btn_create(card);
-  lv_obj_set_size(b_cancel, SC(80), SC(34));
+  lv_obj_set_size(b_cancel, PSC(80), PSC(34));
   lv_obj_align(b_cancel, LV_ALIGN_BOTTOM_LEFT, 0, 0);
   styleButton(b_cancel);
   lv_obj_set_style_bg_color(b_cancel, lv_color_hex(0x3A4A5C), LV_PART_MAIN);
@@ -9623,6 +10068,16 @@ static void openLogModalCb(lv_event_t* e) {
 // goToTab defined after all callbacks that need it
 static void goToTab(int idx) {
   if (!g_lv.tabview) return;
+  // Clear any keyboard-nav focus highlight BEFORE the tab switches. Activating a
+  // clickable element with Enter (e.g. the Home "Unread" line) fires its CLICKED
+  // handler WITHOUT moving group focus, so navFocusCb never runs to un-highlight it
+  // — and the element lives on the now-hidden outgoing tab. Without this, its
+  // reverse-video highlight stayed painted (the "home unread line stays highlighted"
+  // bug). The destination tab's rebuild re-styles whatever it focuses next.
+  // (Keyboard-nav only exists on the Tanmatsu + T-Deck-trackball builds.)
+#if defined(HAS_TANMATSU) || defined(HAS_TDECK_TRACKBALL)
+  if (s_nav_styled) { navUnstyle(s_nav_styled); s_nav_styled = nullptr; }
+#endif
   lv_tabview_set_act(g_lv.tabview, static_cast<uint32_t>(idx), LV_ANIM_ON);
   // lv_tabview_set_act() does NOT emit LV_EVENT_VALUE_CHANGED, so the full
   // tab-change handler (tabChangedCb → onMapTabActivated, status bar, chat
@@ -9704,8 +10159,13 @@ static void openContactsSearchSheetCb(lv_event_t* e) {
   lv_obj_clear_flag(s_contacts_search_sheet, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_contacts_search_sheet, contactsSearchSheetCloseCb, LV_EVENT_CLICKED, nullptr);
 
+#if defined(HAS_TANMATSU)
+  const int card_w = PSC(220);
+  const int card_h = PSC(130);
+#else
   const int card_w = 220;
   const int card_h = 130;
+#endif
   lv_obj_t* card = lv_obj_create(s_contacts_search_sheet);
   lv_obj_remove_style_all(card);
   lv_obj_set_size(card, card_w, card_h);
@@ -9726,8 +10186,8 @@ static void openContactsSearchSheetCb(lv_event_t* e) {
   lv_obj_set_pos(title, 0, 0);
 
   s_contacts_search_ta = lv_textarea_create(card);
-  lv_obj_set_size(s_contacts_search_ta, card_w - 20, 34);
-  lv_obj_set_pos(s_contacts_search_ta, 0, 28);
+  lv_obj_set_size(s_contacts_search_ta, card_w - 20, PSC(34));
+  lv_obj_set_pos(s_contacts_search_ta, 0, PSC(28));
   styleCard(s_contacts_search_ta);
   lv_textarea_set_one_line(s_contacts_search_ta, true);
   lv_textarea_set_max_length(s_contacts_search_ta, (uint32_t)(sizeof(g_lv.contacts_search) - 1));
@@ -9745,8 +10205,8 @@ static void openContactsSearchSheetCb(lv_event_t* e) {
   if (g_lv.keyboard) kbMirrorBind(s_contacts_search_ta);
 
   lv_obj_t* clear_btn = lv_btn_create(card);
-  lv_obj_set_size(clear_btn, 88, 34);
-  lv_obj_set_pos(clear_btn, 0, 70);
+  lv_obj_set_size(clear_btn, PSC(88), PSC(34));
+  lv_obj_set_pos(clear_btn, 0, PSC(70));
   styleButton(clear_btn);
   lv_obj_add_event_cb(clear_btn, contactsSearchClearCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* cl = lv_label_create(clear_btn);
@@ -9754,8 +10214,8 @@ static void openContactsSearchSheetCb(lv_event_t* e) {
   lv_obj_center(cl);
 
   lv_obj_t* apply_btn = lv_btn_create(card);
-  lv_obj_set_size(apply_btn, 110, 34);
-  lv_obj_set_pos(apply_btn, card_w - 20 - 110, 70);
+  lv_obj_set_size(apply_btn, PSC(110), PSC(34));
+  lv_obj_set_pos(apply_btn, card_w - 20 - PSC(110), PSC(70));
   styleButton(apply_btn);
   lv_obj_set_style_bg_color(apply_btn, lv_color_hex(COLOR_STATUS_OK), LV_PART_MAIN);
   lv_obj_add_event_cb(apply_btn, contactsSearchApplyCb, LV_EVENT_CLICKED, nullptr);
@@ -10405,8 +10865,13 @@ static void openAdminLoginPrompt(const ContactInfo& c) {
     closeAdminPwPrompt();
   }, LV_EVENT_CLICKED, nullptr);
 
+#if defined(HAS_TANMATSU)
+  const int card_w = PSC(220);
+  const int card_h = PSC(180);
+#else
   const int card_w = 220;
   const int card_h = 180;   // taller now: room for the Remember checkbox
+#endif
   lv_obj_t* card = lv_obj_create(s_admin_pw_root);
   lv_obj_remove_style_all(card);
   lv_obj_set_size(card, card_w, card_h);
@@ -10446,11 +10911,11 @@ static void openAdminLoginPrompt(const ContactInfo& c) {
                                  : "Password (blank = guest)");
   lv_obj_set_style_text_color(sub, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(sub, &g_font_12, LV_PART_MAIN);
-  lv_obj_set_pos(sub, 0, 22);
+  lv_obj_set_pos(sub, 0, PSC(22));
 
   s_admin_pw_ta = lv_textarea_create(card);
-  lv_obj_set_size(s_admin_pw_ta, card_w - 20, 32);
-  lv_obj_set_pos(s_admin_pw_ta, 0, 42);
+  lv_obj_set_size(s_admin_pw_ta, card_w - 20, PSC(32));
+  lv_obj_set_pos(s_admin_pw_ta, 0, PSC(42));
   styleCard(s_admin_pw_ta);
   lv_textarea_set_one_line(s_admin_pw_ta, true);
   lv_textarea_set_password_mode(s_admin_pw_ta, true);
@@ -10493,12 +10958,12 @@ static void openAdminLoginPrompt(const ContactInfo& c) {
   lv_checkbox_set_text(s_admin_pw_remember, "Remember password");
   lv_obj_set_style_text_color(s_admin_pw_remember, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(s_admin_pw_remember, &g_font_12, LV_PART_MAIN);
-  lv_obj_set_pos(s_admin_pw_remember, 0, 82);
+  lv_obj_set_pos(s_admin_pw_remember, 0, PSC(82));
   lv_obj_add_state(s_admin_pw_remember, LV_STATE_CHECKED);
 
   lv_obj_t* cancel_btn = lv_btn_create(card);
-  lv_obj_set_size(cancel_btn, 88, 32);
-  lv_obj_set_pos(cancel_btn, 0, 116);
+  lv_obj_set_size(cancel_btn, PSC(88), PSC(32));
+  lv_obj_set_pos(cancel_btn, 0, PSC(116));
   styleButton(cancel_btn);
   lv_obj_add_event_cb(cancel_btn, adminPwCancelCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* cl = lv_label_create(cancel_btn);
@@ -10506,8 +10971,8 @@ static void openAdminLoginPrompt(const ContactInfo& c) {
   lv_obj_center(cl);
 
   lv_obj_t* login_btn = lv_btn_create(card);
-  lv_obj_set_size(login_btn, 100, 32);
-  lv_obj_set_pos(login_btn, card_w - 20 - 100, 116);
+  lv_obj_set_size(login_btn, PSC(100), PSC(32));
+  lv_obj_set_pos(login_btn, card_w - 20 - PSC(100), PSC(116));
   styleButton(login_btn);
   lv_obj_set_style_bg_color(login_btn, lv_color_hex(COLOR_STATUS_OK), LV_PART_MAIN);
   lv_obj_add_event_cb(login_btn, adminPwSubmitCb, LV_EVENT_CLICKED, nullptr);
@@ -10813,7 +11278,11 @@ static void losModalCloseCb(lv_event_t* e) {
 static void losDrawPlot() {
   if (!s_los_card || s_los_got < k_los_samples) return;
   lv_obj_t* card = s_los_card;
-  const int card_w = 230;
+  // PSC() scales card geometry up ~1.7× on Tanmatsu (no-op on T-Deck/V4), so
+  // the chart fills the 800×480 panel instead of looking lost. Width, graph
+  // height and every stacked Y offset below all go through PSC() so the plot
+  // stays aligned with its axis labels / sliders / verdict at any board+scale.
+  const int card_w = PSC(230);
 
   const double self_lat = s_los_self_lat, self_lon = s_los_self_lon;
   const double peer_lat = s_los_peer_lat, peer_lon = s_los_peer_lon;
@@ -10851,7 +11320,7 @@ static void losDrawPlot() {
   // ---- Cross-section drawing area (recreated each draw) ----
   // Shorter graph in landscape so the antenna controls + verdict still fit the
   // capped card height. cy in losRenderResult must stay = gy + gh + 6.
-  const int gx = 0, gy = 28, gw = card_w - 16, gh = chatLandscape() ? 58 : 80;
+  const int gx = 0, gy = PSC(28), gw = card_w - 16, gh = PSC(chatLandscape() ? 58 : 80);
   if (s_los_plot) { lv_obj_del(s_los_plot); s_los_plot = nullptr; }
   lv_obj_t* graph = lv_obj_create(card);
   s_los_plot = graph;
@@ -10985,7 +11454,7 @@ static void losPeerPlusCb(lv_event_t* e) {
 static void losRenderResult() {
   if (!s_los_card) return;
   lv_obj_t* card = s_los_card;
-  const int card_w = 230;
+  const int card_w = PSC(230);   // matches losDrawPlot()/builder — see PSC() note there
   const int gw = card_w - 16;
 
   if (s_los_got < k_los_samples) {
@@ -10999,11 +11468,14 @@ static void losRenderResult() {
 
   // Antenna height controls, directly under each end of the graph:
   //   left = your antenna, right = the contact's. [-] value [+]
-  // Just below the graph: gy(28) + gh + 6. gh is 58 in landscape, 80 portrait.
-  const int cy = chatLandscape() ? 92 : 114;
+  // Just below the graph: gy + gh + 6, derived from the SAME PSC()-scaled pieces
+  // losDrawPlot() uses for the graph (gy=PSC(28), gh=PSC(58|80)) so the controls
+  // stay glued under the graph at any board/UI-scale instead of drifting. Button
+  // + value sizes/X-offsets also go through PSC() so the clusters don't bunch up.
+  const int cy = PSC(28) + PSC(chatLandscape() ? 58 : 80) + PSC(6);
   auto mk_h_btn = [&](const char* sym, int x, lv_event_cb_t cb) {
     lv_obj_t* b = lv_btn_create(card);
-    lv_obj_set_size(b, 26, 24);
+    lv_obj_set_size(b, PSC(26), PSC(24));
     lv_obj_set_pos(b, x, cy);
     styleButton(b);
     lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);
@@ -11015,8 +11487,8 @@ static void losRenderResult() {
   };
   auto mk_h_val = [&](int x) {
     lv_obj_t* l = lv_label_create(card);
-    lv_obj_set_size(l, 42, 24);
-    lv_obj_set_pos(l, x, cy + 4);
+    lv_obj_set_size(l, PSC(42), PSC(24));
+    lv_obj_set_pos(l, x, cy + PSC(4));
     lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
     lv_obj_set_style_text_color(l, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
     lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
@@ -11025,12 +11497,12 @@ static void losRenderResult() {
   };
   // Left cluster (you)
   mk_h_btn("-", 0, losSelfMinusCb);
-  s_los_self_h_lbl = mk_h_val(28);
-  mk_h_btn("+", 72, losSelfPlusCb);
+  s_los_self_h_lbl = mk_h_val(PSC(28));
+  mk_h_btn("+", PSC(72), losSelfPlusCb);
   // Right cluster (peer)
-  mk_h_btn("-", gw - 98, losPeerMinusCb);
-  s_los_peer_h_lbl = mk_h_val(gw - 70);
-  mk_h_btn("+", gw - 26, losPeerPlusCb);
+  mk_h_btn("-", gw - PSC(98), losPeerMinusCb);
+  s_los_peer_h_lbl = mk_h_val(gw - PSC(70));
+  mk_h_btn("+", gw - PSC(26), losPeerPlusCb);
 
   // Verdict label (text updated by losDrawPlot).
   s_los_verdict = lv_label_create(card);
@@ -11038,7 +11510,7 @@ static void losRenderResult() {
   lv_obj_set_width(s_los_verdict, gw);
   lv_obj_set_style_text_font(s_los_verdict, &g_font_12, LV_PART_MAIN);
   lv_label_set_recolor(s_los_verdict, true);
-  lv_obj_set_pos(s_los_verdict, 0, cy + 30);
+  lv_obj_set_pos(s_los_verdict, 0, cy + PSC(30));
 
   losDrawPlot();
 }
@@ -11103,8 +11575,8 @@ static void openLosModal(uint32_t mesh_idx) {
   // Cap the card to the usable height so it fits the shorter landscape screen
   // (the graph + controls shrink to match — see chatLandscape() in losDrawPlot
   // / losRenderResult).
-  const int card_w = 230;
-  int card_h = 248;
+  const int card_w = PSC(230);   // matches losDrawPlot()/losRenderResult() — see PSC() note in losDrawPlot()
+  int card_h = PSC(248);
   if (card_h > modalAvailH()) card_h = modalAvailH();
   lv_obj_t* card = lv_obj_create(s_los_root);
   s_los_card = card;
@@ -11216,6 +11688,16 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   // Tap outside closes the sheet
   lv_obj_add_event_cb(s_action_sheet_root, actionSheetCloseCb, LV_EVENT_CLICKED, nullptr);
 
+  // On the big 800×480 Tanmatsu the 232-wide sheet looked lost in the middle, so
+  // widen the card and grow the rows/gaps/title. The non-Tanmatsu values are the
+  // historical integers, untouched (PSC is a no-op there).
+#if defined(HAS_TANMATSU)
+  const int card_w = PSC(232);
+  const int btn_h = PSC(30);
+  const int btn_gap = PSC(6);
+  const int title_h = PSC(28);
+  const int padding = PSC(6);
+#else
   const int card_w = 232;
   // Two-column button grid so the (now up to 9) actions fit without
   // clipping below the status bar. Delete spans the full width as the
@@ -11225,6 +11707,7 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   const int btn_gap = 6;
   const int title_h = 28;
   const int padding = 6;
+#endif
   // msg/ping + telemetry + (trace ping + admin, repeaters only) + range
   // test + favorite/unfavorite + reset path + delete. Chat peers get 6
   // rows; repeaters get 8 (Trace SNR + Admin). +1 for "Line of sight" when
@@ -11293,10 +11776,21 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
   lv_obj_set_width(title, card_w - 2 * padding - 28);
   lv_obj_set_pos(title, 0, 0);
 
+#if defined(HAS_TANMATSU)
+  const int col_gap = PSC(6);
+#else
   const int col_gap = 6;
+#endif
   const int half_w  = (card_w - 2 * padding - col_gap) / 2;
   int y   = title_h;
   int col = 0;   // 0 = left column, 1 = right column
+  // On the Tanmatsu the rows are PSC-taller, so step the row label up one font
+  // size to fill them; the smaller boards keep the original g_font_12.
+#if defined(HAS_TANMATSU)
+  const lv_font_t* row_font = &g_font_14;
+#else
+  const lv_font_t* row_font = &g_font_12;
+#endif
 
   // Half-width grid button. Advances column, wrapping to the next row.
   auto mk_btn = [&](const char* label, lv_event_cb_t cb, uint32_t bg) {
@@ -11310,7 +11804,7 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t* l = lv_label_create(b);
     lv_label_set_text(l, TR(label));
-    lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_font(l, row_font, LV_PART_MAIN);
     lv_obj_center(l);
     if (col == 0) col = 1;
     else { col = 0; y += btn_h + btn_gap; }
@@ -11328,7 +11822,7 @@ static void openContactActionSheet(uint32_t mesh_idx, bool is_repeater, const ch
     lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, nullptr);
     lv_obj_t* l = lv_label_create(b);
     lv_label_set_text(l, TR(label));
-    lv_obj_set_style_text_font(l, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_style_text_font(l, row_font, LV_PART_MAIN);
     lv_obj_center(l);
     y += btn_h + btn_gap;
   };
@@ -11942,16 +12436,18 @@ static void openAddChannelSheet() {
   lv_obj_add_event_cb(s_addch_sheet, addChannelSheetDismissCb, LV_EVENT_CLICKED, nullptr);
 
   const int rows  = 4;
-  const int pad   = 10;
+  const int pad   = PSC(10);
+  const int hdr_h = PSC(36);
+  const int row_gap = PSC(6);
   // Shrink the button height if the four rows + header won't fit the (shorter)
-  // landscape viewport, so the card never runs off-screen.
-  int btn_h = 38;
-  if (36 + rows * (btn_h + 6) + pad > modalAvailH())
-    btn_h = ((modalAvailH() - 36 - pad) / rows) - 6;
-  if (btn_h < 26) btn_h = 26;
-  int card_w = 220;
+  // landscape viewport, so the card never runs off-screen. Bigger on the Tanmatsu.
+  int btn_h = PSC(38);
+  if (hdr_h + rows * (btn_h + row_gap) + pad > modalAvailH())
+    btn_h = ((modalAvailH() - hdr_h - pad) / rows) - row_gap;
+  if (btn_h < PSC(26)) btn_h = PSC(26);
+  int card_w = PSC(220);
   if (card_w > modalAvailW()) card_w = modalAvailW();
-  const int card_h = 36 + rows * (btn_h + 6) + pad;
+  const int card_h = hdr_h + rows * (btn_h + row_gap) + pad;
   lv_obj_t* card = lv_obj_create(s_addch_sheet);
   lv_obj_remove_style_all(card);
   lv_obj_set_size(card, card_w, card_h);
@@ -11971,7 +12467,7 @@ static void openAddChannelSheet() {
   lv_obj_set_style_text_font(title, &g_font_14, LV_PART_MAIN);
   lv_obj_set_pos(title, 0, 0);
 
-  int y = 28;
+  int y = PSC(28);
   auto mk = [&](const char* label, lv_event_cb_t cb) {
     lv_obj_t* b = lv_btn_create(card);
     lv_obj_set_size(b, card_w - 2 * pad, btn_h);
@@ -11982,7 +12478,7 @@ static void openAddChannelSheet() {
     lv_label_set_text(l, TR(label));
     lv_obj_set_style_text_font(l, &g_font_14, LV_PART_MAIN);
     lv_obj_center(l);
-    y += btn_h + 6;
+    y += btn_h + row_gap;
   };
   mk("Create a private channel", addChannelCreatePrivateCb);
   mk("Join a private channel",   addChannelJoinPrivateCb);
@@ -12093,12 +12589,12 @@ static void openShareMyContactPopup() {
   // the operator wants to dictate it over voice and there's no camera).
   // Clamp to the usable area and scale the QR to fit so the popup never runs
   // off the shorter landscape screen.
-  int card_w = 220;
+  int card_w = PSC(220);
   if (card_w > modalAvailW()) card_w = modalAvailW();
-  int card_h = 270;
+  int card_h = PSC(270);
   if (card_h > modalAvailH()) card_h = modalAvailH();
   int qr_size = card_h - 34 - 30 - 20;   // title row + hex caption + padding
-  if (qr_size > 160) qr_size = 160;
+  if (qr_size > PSC(160)) qr_size = PSC(160);   // bigger QR on the Tanmatsu panel
   if (qr_size > card_w - 20) qr_size = card_w - 20;
   if (qr_size < 96) qr_size = 96;
   lv_obj_t* card = lv_obj_create(s_share_my_root);
@@ -12859,8 +13355,10 @@ static char      s_fm_path[160]  = {0};     // current dir within s_fm_fs (e.g. 
 // fmRefresh, so they blip the LED too.
 #if defined(HAS_TDECK_GT911)
 static inline bool fmIsSd(fs::FS* fs) { return fs == &SD; }
+#elif defined(HAS_TANMATSU)
+static inline bool fmIsSd(fs::FS* fs) { return fs == &SD_MMC; }   // microSD on SDMMC slot 0
 #else
-static inline bool fmIsSd(fs::FS*) { return false; }       // Heltec/Tanmatsu: no Arduino SD global in this FM path
+static inline bool fmIsSd(fs::FS*) { return false; }       // Heltec: no Arduino SD global in this FM path
 #endif
 static inline void fmMarkSdIo() { if (fmIsSd(s_fm_fs)) markSdIo(); }
 #if defined(HAS_TANMATSU)
@@ -14768,6 +15266,36 @@ static void fmRefresh() {
 }
 
 // Roots screen: list the available storages.
+#if defined(HAS_TANMATSU)
+// ---- Tanmatsu microSD (SDMMC slot 0) -------------------------------------------------------------
+// The card sits on the P4's SDMMC *slot 0* (IOMUX pins CLK43/CMD44/D0-3 39-42, selected by the
+// BOARD_SDMMC_SLOT=0 build define); slot 1 is the C6 radio (esp-hosted SDIO), which we never touch —
+// so mounting here can't disturb Wi-Fi/BLE. External-powered IO (no on-chip LDO), 4-bit, mounted
+// LAZILY on first browse so the radio is already up. SD_MMC is the fs::FS the file manager browses,
+// exactly like the T-Deck's &SD.
+static bool     s_tan_sd_mounted     = false;
+static uint64_t s_tan_sd_size        = 0;
+static uint32_t s_tan_sd_retry_after = 0;   // backoff so an absent/cold card isn't re-probed every render
+static bool tanSdTryMount() {
+  if (s_tan_sd_mounted) return true;
+  if (millis() < s_tan_sd_retry_after) return false;
+  if (SD_MMC.begin("/sdcard", false /*4-bit*/) && SD_MMC.cardType() != CARD_NONE) {
+    s_tan_sd_mounted = true;
+    s_tan_sd_size = SD_MMC.cardSize();
+    return true;
+  }
+  SD_MMC.end();
+  s_tan_sd_retry_after = millis() + 8000;   // don't grind a missing card on every roots render
+  return false;
+}
+static void tanSdClickCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+  s_tan_sd_retry_after = 0;                  // user tapped explicitly — bypass the backoff
+  if (tanSdTryMount()) fmOpenStorage(&SD_MMC, "SD", "/");
+  else if (g_lv.task)  g_lv.task->showAlert(TR("No SD card (or unreadable format)"), 2000);
+}
+#endif
+
 static void fmShowRoots() {
   s_fm_fs = nullptr;
   s_fm_path[0] = '\0';
@@ -14806,6 +15334,22 @@ static void fmShowRoots() {
     lv_obj_t* sd = lv_list_add_btn(s_fm_list, LV_SYMBOL_SD_CARD, "SD card   (tap to mount/format)");
     fmStyleRow(sd, COLOR_SUB);
     lv_obj_add_event_cb(sd, fmSdMountOrFormatCb, LV_EVENT_CLICKED, nullptr);
+  }
+#endif
+#if defined(HAS_TANMATSU)
+  // microSD (SDMMC slot 0). Probe outside the mount-backoff window so an absent card doesn't grind
+  // the bus on every render; tapping the row forces a fresh mount attempt (tanSdClickCb clears it).
+  if ((s_tan_sd_mounted || millis() >= s_tan_sd_retry_after) && tanSdTryMount()) {
+    char sdl[48], cs[16];
+    fmFmtSize64(s_tan_sd_size, cs, sizeof cs);
+    snprintf(sdl, sizeof sdl, TR("SD card   %s"), cs);
+    lv_obj_t* sd = lv_list_add_btn(s_fm_list, LV_SYMBOL_SD_CARD, sdl);
+    fmStyleRow(sd, COLOR_TEXT);
+    lv_obj_add_event_cb(sd, tanSdClickCb, LV_EVENT_CLICKED, nullptr);
+  } else {
+    lv_obj_t* sd = lv_list_add_btn(s_fm_list, LV_SYMBOL_SD_CARD, TR("SD card   (tap to mount)"));
+    fmStyleRow(sd, COLOR_SUB);
+    lv_obj_add_event_cb(sd, tanSdClickCb, LV_EVENT_CLICKED, nullptr);
   }
 #endif
 }
@@ -15535,6 +16079,13 @@ static void homeAppsBtnCb(lv_event_t* e) {   // "Apps" launcher on the command c
   if (lv_event_get_code(e) == LV_EVENT_CLICKED) setHomeDrawer(true);
 }
 
+// Fwd decl (the one at the top of the file is behind the keyboard-nav guard, so it's
+// invisible to the non-nav touch builds like the Heltec V4 that still compile this cb).
+static void toggleControlCenter();
+static void homeControlPanelCb(lv_event_t* e) {   // "Control panel" launcher -> open the top-bar control-center dropdown
+  if (lv_event_get_code(e) == LV_EVENT_CLICKED) toggleControlCenter();
+}
+
 static void makeHome(lv_obj_t* tab) {
   // Layout (240 wide × 282 tall): title + heartbeat + battery at top, status
   // lines, TX/RX chart in the middle, Send Advert button at the bottom.
@@ -15568,6 +16119,7 @@ static void makeHome(lv_obj_t* tab) {
   s_home_batt_pct   = nullptr;
   s_home_batt_icon  = nullptr;
   s_home_chart_sig  = nullptr;
+  g_lv.home_apps    = nullptr;   // set below iff the right-hand launcher column is built (landscape)
 #if defined(HAS_EXPANSION_KIT)
   s_home_env_chart  = nullptr;
   s_home_adv_btn    = nullptr;
@@ -15720,6 +16272,20 @@ static void makeHome(lv_obj_t* tab) {
   if (home_scaled) chart_h = 0;
 #else
   const bool home_scaled = false;
+  // Non-Tanmatsu landscape (T-Deck) right-hand column: Advert + launchers spread
+  // evenly down the FULL content height so a 4th launcher ("Control panel") fits the
+  // short 168-px T-Deck strip without overflowing. Slot count tracks the build:
+  // GT911 (T-Deck) = Advert+Terminal+Files+Apps+Control = 5; otherwise 4.
+#if defined(HAS_TDECK_GT911)
+  const int td_btn_n = 5;
+#else
+  const int td_btn_n = 4;
+#endif
+  const int td_btn_gap = 6;
+  int td_btn_h = (home_avail - (td_btn_n - 1) * td_btn_gap) / td_btn_n;
+  if (td_btn_h > 46) td_btn_h = 46;                 // don't grow past the old Advert height
+  if (td_btn_h < 22) td_btn_h = 22;
+  auto tdBtnY = [&](int slot) { return slot * (td_btn_h + td_btn_gap); };
 #endif
   s_home_chart = home_scaled ? nullptr : lv_chart_create(tab);
   if (s_home_chart) {
@@ -15835,8 +16401,8 @@ static void makeHome(lv_obj_t* tab) {
     lv_obj_set_size(adv, BTNW, tan_btn_h);               // slot 0 of the spread right column
     lv_obj_align(adv, LV_ALIGN_TOP_LEFT, cw - BTNW, tanBtnY(0));
 #else
-    lv_obj_set_size(adv, 100, 46);
-    lv_obj_align(adv, LV_ALIGN_TOP_LEFT, cw - 100, 4);   // top aligns with the status text
+    lv_obj_set_size(adv, BTNW, td_btn_h);                // slot 0 of the evenly-spread T-Deck column
+    lv_obj_align(adv, LV_ALIGN_TOP_LEFT, cw - BTNW, tdBtnY(0));
 #endif
   } else {
     lv_obj_set_size(adv, cw, 36);
@@ -15855,12 +16421,11 @@ static void makeHome(lv_obj_t* tab) {
 #endif
 
 #if defined(HAS_TOUCH_UI)
-  // Terminal / Files / Apps launchers, stacked under Advert in the right column.
-  // 34-px tall so all four (incl. Advert) fit the short landscape screen.
-  // Files is SD-backed so it stays T-Deck/Tanmatsu-only; the mesh console
-  // (Terminal) + Apps drawer are available on every touch board.
+  // Terminal / Files / Apps / Control-panel launchers, stacked under Advert in the
+  // right column and spread to fill the full content height. Files is SD-backed so it
+  // stays T-Deck-only; Terminal + Apps + Control panel are on every touch board.
   if (home_land) {
-    auto make_launcher = [&](const char* label, int ly, lv_event_cb_t cb, uint32_t bg, int bh) {
+    auto make_launcher = [&](const char* label, int ly, lv_event_cb_t cb, uint32_t bg, int bh) -> lv_obj_t* {
       lv_obj_t* b = lv_btn_create(tab);
       styleButton(b);
       lv_obj_set_size(b, BTNW, bh);
@@ -15873,28 +16438,32 @@ static void makeHome(lv_obj_t* tab) {
       lv_obj_set_style_text_font(l, bh >= 44 ? &g_font_14 : &g_font_12, LV_PART_MAIN);
       lv_obj_set_style_text_color(l, lv_color_hex(bg ? 0xFFFFFF : COLOR_TEXT), LV_PART_MAIN);
       lv_obj_center(l);
+      return b;
     };
+    // The accent's inverse — used for the "Apps" pop colour and the Control-panel button.
+    const uint32_t inv_accent = 0xFFFFFFu ^ (COLOR_ACCENT & 0xFFFFFFu);
 #if defined(HAS_TANMATSU)
     make_launcher(">_  Terminal", tanBtnY(1), homeTerminalCb, 0, tan_btn_h);
 #if defined(HAS_TDECK_GT911)
     make_launcher(LV_SYMBOL_DIRECTORY "  Files", tanBtnY(2), homeFilesCb, 0, tan_btn_h);
     // "Apps" (opens the app drawer) pops with the negative / inverse of the theme accent.
-    make_launcher(LV_SYMBOL_LIST "  Apps", tanBtnY(3), homeAppsBtnCb,
-                  0xFFFFFFu ^ (COLOR_ACCENT & 0xFFFFFFu), tan_btn_h);
+    g_lv.home_apps = make_launcher(LV_SYMBOL_LIST "  Apps", tanBtnY(3), homeAppsBtnCb, inv_accent, tan_btn_h);
 #else
-    make_launcher(LV_SYMBOL_LIST "  Apps", tanBtnY(2), homeAppsBtnCb,
-                  0xFFFFFFu ^ (COLOR_ACCENT & 0xFFFFFFu), tan_btn_h);
+    // Real Tanmatsu (no GT911 / no Files): Apps in slot 2, Control panel fills slot 3.
+    g_lv.home_apps = make_launcher(LV_SYMBOL_LIST "  Apps", tanBtnY(2), homeAppsBtnCb, inv_accent, tan_btn_h);
+    make_launcher(LV_SYMBOL_BARS "  Control", tanBtnY(3), homeControlPanelCb, 0, tan_btn_h);   // ☰ (mirrors the CC sliders), not the settings gear
 #endif
 #else
-    make_launcher(">_  Terminal", 54, homeTerminalCb, 0, 34);
+    // T-Deck (and any other non-Tanmatsu landscape board): evenly-spread slots.
+    make_launcher(">_  Terminal", tdBtnY(1), homeTerminalCb, 0, td_btn_h);
 #if defined(HAS_TDECK_GT911)
-    make_launcher(LV_SYMBOL_DIRECTORY "  Files", 92, homeFilesCb, 0, 34);
+    make_launcher(LV_SYMBOL_DIRECTORY "  Files", tdBtnY(2), homeFilesCb, 0, td_btn_h);
     // "Apps" (opens the app drawer) pops with the negative / inverse of the theme accent.
-    make_launcher(LV_SYMBOL_LIST "  Apps", 130, homeAppsBtnCb,
-                  0xFFFFFFu ^ (COLOR_ACCENT & 0xFFFFFFu), 34);
+    g_lv.home_apps = make_launcher(LV_SYMBOL_LIST "  Apps", tdBtnY(3), homeAppsBtnCb, inv_accent, td_btn_h);
+    make_launcher(LV_SYMBOL_SETTINGS "  Control", tdBtnY(4), homeControlPanelCb, 0, td_btn_h);
 #else
-    make_launcher(LV_SYMBOL_LIST "  Apps", 92, homeAppsBtnCb,
-                  0xFFFFFFu ^ (COLOR_ACCENT & 0xFFFFFFu), 34);
+    g_lv.home_apps = make_launcher(LV_SYMBOL_LIST "  Apps", tdBtnY(2), homeAppsBtnCb, inv_accent, td_btn_h);
+    make_launcher(LV_SYMBOL_SETTINGS "  Control", tdBtnY(3), homeControlPanelCb, 0, td_btn_h);
 #endif
 #endif
   }
@@ -16078,7 +16647,8 @@ static void openContactsOverflowSheetCb(lv_event_t* e) {
   lv_obj_move_foreground(s_contacts_overflow_root);
   lv_obj_add_event_cb(s_contacts_overflow_root, contactsOverflowDismissCb, LV_EVENT_CLICKED, nullptr);
 
-  const int card_w = 200, btn_h = 36, btn_gap = 6, title_h = 26, padding = 8;
+  // Bigger on the 800-px Tanmatsu panel; unchanged on the smaller boards (PSC no-op).
+  const int card_w = PSC(200), btn_h = PSC(36), btn_gap = PSC(6), title_h = PSC(26), padding = PSC(8);
   const int rows = 4;
   const int card_h = title_h + rows * (btn_h + btn_gap) + padding;
   lv_obj_t* card = lv_obj_create(s_contacts_overflow_root);
@@ -16756,6 +17326,22 @@ static inline void tileCacheMkdir(const char* rel) {
 // areas still display — only NEW tiles stop being cached.
 static bool tilesFsLowSpace() {
   if (!s_tiles_fs_ready || !s_tile_fs) return false;   // no cache backend -> nothing to guard
+#if defined(HAS_TANMATSU)
+  // Tanmatsu: the tile cache rides the SHARED FFat 'locfd' partition (~3.9 MB, also home to
+  // DataStore / chat history). The SD + LittleFS guards below don't cover FFat, so cap it here:
+  // stop caching tiles while < ~1.5 MB is free, leaving chat data plenty of room to grow.
+  if (s_tile_fs == &FFat) {
+    static uint32_t last_ms = 0; static bool low = false;
+    const uint32_t now = millis();
+    if (last_ms == 0 || (uint32_t)(now - last_ms) >= 5000) {
+      last_ms = now ? now : 1;
+      const size_t tot = FFat.totalBytes(), use = FFat.usedBytes();
+      const size_t freeb = (tot > use) ? (tot - use) : 0;
+      low = (tot > 0) && (freeb < 1536 * 1024);
+    }
+    return low;
+  }
+#endif
   // This guard exists ONLY for the small (4.75 MB) LittleFS "tiles" partition,
   // where a full FS faults inside lfs_alloc during the dir mkdir. It must inspect
   // the ACTIVE backend, not s_tiles_fs unconditionally. On the SD fallback
@@ -16885,13 +17471,24 @@ constexpr uint8_t k_map_zoom_max      = 19;
 constexpr uint8_t k_map_zoom_default  = 14;
 // 3×3 grid covers a 768×768-px slab — ~130 px of pan buffer on each side
 // of the 240×226 viewport. We tried 5×5 (25 tiles, 3.2 MB PSRAM) for the
-// bigger buffer but it pushed PSRAM usage to the edge — some tile decodes
-// silently failed alloc and stayed black. Stuck back at 3×3 (9 tiles,
-// 1.15 MB) for reliability; the dark-edge issue on big pans is a smaller
-// problem than randomly-missing tiles.
-constexpr int     k_map_grid_radius   = 1;     // tiles each side of center
+// bigger buffer but it pushed PSRAM usage to the edge on the S3 boards —
+// some tile decodes silently failed alloc and stayed black. So the radius
+// is now sized PER AXIS from the actual canvas (mapComputeGridRadius):
+// small screens (V4/T-Deck 240/320) stay at radius 1 (3 tiles/axis = 9
+// total, ~1.15 MB), while the wide Tanmatsu (800×480) needs a horizontal
+// radius of 2 so the 3-tile/768-px span doesn't leave an uncovered strip
+// at one edge of the 800-px width. The static slot array is sized to the
+// worst case (k_map_grid_radius_max); only tiles actually loaded allocate
+// their 128 KB PSRAM buffer, so the extra slots cost only pointer-sized
+// struct entries in .bss, not PSRAM, on the small boards.
+constexpr int     k_map_grid_radius_max = 2;   // max tiles/axis we ever request (Tanmatsu)
 constexpr int     k_map_visible_tiles_max =
-    (2 * k_map_grid_radius + 1) * (2 * k_map_grid_radius + 1);
+    (2 * k_map_grid_radius_max + 1) * (2 * k_map_grid_radius_max + 1);
+// Runtime per-axis radius (recomputed from k_map_canvas_w/h when the map
+// tab is built — see mapComputeGridRadius). Default to 1 for the common
+// small-screen case before the map tab exists.
+static int        s_map_grid_rx = 1;           // tiles each side, horizontal
+static int        s_map_grid_ry = 1;           // tiles each side, vertical
 
 // Per-tile: we hold the *decoded* RGB565 in PSRAM, not the JPEG. Decoding
 // happens ONCE at load time (in our control). The lv_img widget is then
@@ -16912,6 +17509,23 @@ struct MapTile {
 };
 
 static MapTile  s_map_tiles[k_map_visible_tiles_max] = {};
+// Recompute the per-axis tile radius from the current canvas size. Enough
+// tiles must straddle the center so the grid covers the FULL viewport even
+// when the center coordinate sits at the very edge of its center tile:
+// worst case the center is 256 px from one side of its tile, so each side
+// needs ceil((canvas/2) / 256) tiles → ceil(canvas / 512). Clamped to
+// [1, k_map_grid_radius_max]. Small screens (≤512 px) stay at 1; the
+// 800-px-wide Tanmatsu lands on rx = 2 (5 tiles = 1280 px ≥ 800).
+static void mapComputeGridRadius() {
+  auto r = [](int dim) -> int {
+    int n = (dim + 511) / 512;                 // ceil(dim / 512)
+    if (n < 1) n = 1;
+    if (n > k_map_grid_radius_max) n = k_map_grid_radius_max;
+    return n;
+  };
+  s_map_grid_rx = r(k_map_canvas_w);
+  s_map_grid_ry = r(k_map_canvas_h);
+}
 // Pan layer: a single transparent lv_obj that holds tile widgets + marker
 // widgets. Live-pan just translates THIS — one set_pos = one invalidation,
 // regardless of how many children sit on top.
@@ -17954,11 +18568,12 @@ static void renderMapTiles() {
   //      - doesn't match → free the slot (becomes "empty", available below).
   //   3. For each wanted coord not yet present in any slot, load into an
   //      empty slot.
+  mapComputeGridRadius();   // size the grid to the current canvas (covers full width on the Tanmatsu)
   struct Wanted { int32_t tx; int32_t ty; bool placed; };
   Wanted wanted[k_map_visible_tiles_max];
   int n_wanted = 0;
-  for (int dy = -k_map_grid_radius; dy <= k_map_grid_radius; ++dy) {
-    for (int dx = -k_map_grid_radius; dx <= k_map_grid_radius; ++dx) {
+  for (int dy = -s_map_grid_ry; dy <= s_map_grid_ry; ++dy) {
+    for (int dx = -s_map_grid_rx; dx <= s_map_grid_rx; ++dx) {
       if (n_wanted >= k_map_visible_tiles_max) break;
       wanted[n_wanted++] = { ctx + dx, cty + dy, false };
     }
@@ -18127,6 +18742,15 @@ static void renderMapTiles() {
     else
       lv_label_set_text(s_map_status_lbl,
           TR("No map storage.\n\nInsert an SD card to cache\nWi-Fi tiles (or reflash to\nrestore the tiles partition)."));
+#elif defined(HAS_TANMATSU)
+    // Tanmatsu has no tiles partition by design (see the FFat fallback in begin()).
+    // Never tell the user to "reflash the partition" — the map runs network-only.
+    if (wifi_up)
+      lv_label_set_text(s_map_status_lbl,
+          TR("Loading map tiles\xe2\x80\xa6\n\nKeep Wi-Fi connected.\nTiles appear as they arrive."));
+    else
+      lv_label_set_text(s_map_status_lbl,
+          TR("No map tiles here.\n\nConnect to Wi-Fi (Settings \xe2\x86\x92 Wi-Fi)\nto download this area."));
 #else
     lv_label_set_text(s_map_status_lbl,
         TR("Map storage error.\nReflash the tiles partition."));
@@ -18851,8 +19475,8 @@ static void mapReloadVisibleTiles() {
     double zwx, zwy;
     latLonToWorldPx(s_map_center_lat, s_map_center_lon, (uint8_t)z, &zwx, &zwy);
     const int32_t zctx = (int32_t)floor(zwx / 256.0), zcty = (int32_t)floor(zwy / 256.0);
-    for (int dy = -k_map_grid_radius; dy <= k_map_grid_radius; ++dy) {
-      for (int dx = -k_map_grid_radius; dx <= k_map_grid_radius; ++dx) {
+    for (int dy = -s_map_grid_ry; dy <= s_map_grid_ry; ++dy) {
+      for (int dx = -s_map_grid_rx; dx <= s_map_grid_rx; ++dx) {
         const int32_t tx = zctx + dx, ty = zcty + dy;
         char path[48];
         snprintf(path, sizeof(path), "/tiles/%u/%ld/%ld.jpg", (unsigned)z, (long)tx, (long)ty);
@@ -19165,11 +19789,12 @@ static void openMapPicker(const int* idxs, int n) {
   lv_obj_clear_flag(s_map_picker_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_map_picker_root, mapPickerBackdropCb, LV_EVENT_CLICKED, nullptr);
 
-  const int card_w = 220;
-  const int btn_h  = 34;
-  const int gap    = 4;
-  const int hdr_h  = 30;
-  const int pad    = 10;
+  // Bigger on the 800-px Tanmatsu panel; unchanged on the smaller boards (PSC no-op).
+  const int card_w = PSC(220);
+  const int btn_h  = PSC(34);
+  const int gap    = PSC(4);
+  const int hdr_h  = PSC(30);
+  const int pad    = PSC(10);
   const int card_h = hdr_h + n * (btn_h + gap) + pad;
 
   lv_obj_t* card = lv_obj_create(s_map_picker_root);
@@ -19603,6 +20228,37 @@ static void mapCanvasEventCb(lv_event_t* e) {
   refreshMapInfoLabel();
 }
 
+#if defined(HAS_TANMATSU)
+// Keyboard pan (Ctrl+Arrow on the Map tab). Mirrors the drag-release math in
+// mapCanvasEventCb: synthesize a pixel delta of ~1/4 the visible span in the
+// arrow direction, convert it through the same world-px ↔ lat/lon helpers (so
+// the lon step automatically scales with the current zoom's degrees-per-pixel)
+// and re-render. dir: 0=up(north,+lat) 1=down(south,−lat) 2=left(west,−lon)
+// 3=right(east,+lon).
+static void mapNudge(int dir) {
+  if (!s_map_canvas) return;
+  // No center yet (no GPS / location) → nothing to pan around.
+  if (s_map_center_lat == 0.0 && s_map_center_lon == 0.0) return;
+  double cwx, cwy;
+  latLonToWorldPx(s_map_center_lat, s_map_center_lon, s_map_zoom, &cwx, &cwy);
+  const double step_x = k_map_canvas_w / 4.0;   // quarter of the visible span
+  const double step_y = k_map_canvas_h / 4.0;
+  switch (dir) {
+    case 0: cwy -= step_y; break;   // up    = north = smaller world_y
+    case 1: cwy += step_y; break;   // down  = south
+    case 2: cwx -= step_x; break;   // left  = west  = smaller world_x
+    case 3: cwx += step_x; break;   // right = east
+    default: return;
+  }
+  worldPxToLatLon(cwx, cwy, s_map_zoom, &s_map_center_lat, &s_map_center_lon);
+  // Match the touch-drag: it does NOT clear s_map_follow, so neither do we
+  // (mapAutoFollowTick re-centers on the next GPS move regardless).
+  renderMapTiles();
+  renderMapMarkers();
+  refreshMapInfoLabel();
+}
+#endif  // HAS_TANMATSU (mapNudge)
+
 // ----- Zoom + recenter -----
 //
 // Zoom PROBES whether the requested level is usable at the current center
@@ -19929,6 +20585,7 @@ static void makeMapTab(lv_obj_t* tab) {
   // full-screen canvas projects to the full screen.
   k_map_canvas_w = lv_disp_get_hor_res(nullptr);
   k_map_canvas_h = lv_disp_get_ver_res(nullptr);
+  mapComputeGridRadius();   // size the tile grid to cover this canvas edge-to-edge
   constexpr int kMapInfoH = 34;   // bottom info strip height (floats over the map)
 
   s_map_canvas = lv_obj_create(lv_scr_act());
@@ -20167,6 +20824,55 @@ static void msgsScrollCb(lv_event_t* e) {
     lv_obj_add_flag(p->jump_btn, LV_OBJ_FLAG_HIDDEN);
 }
 
+#if defined(HAS_TANMATSU)
+// Draw one coloured F-key OUTLINE shape (△ □ ○ ⏢ ◇) into a fresh SZ×SZ canvas child of `parent`,
+// centred. Mirrors the bottom tab-bar key hints (navBuildTabKeyHints) so the in-chat chips read as
+// "press the same-coloured hardware key". Returns the canvas (non-clickable).
+static lv_obj_t* makeFkeyShape(lv_obj_t* parent, int shape, uint32_t rgb, int SZ) {
+  lv_color_t col = lv_color_hex(rgb);
+  lv_obj_t* cv = lv_canvas_create(parent);
+  lv_obj_clear_flag(cv, LV_OBJ_FLAG_CLICKABLE);
+  uint8_t* buf = (uint8_t*)heap_caps_malloc(LV_CANVAS_BUF_SIZE_TRUE_COLOR_ALPHA(SZ, SZ), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!buf) buf = (uint8_t*)malloc(LV_CANVAS_BUF_SIZE_TRUE_COLOR_ALPHA(SZ, SZ));
+  if (!buf) return cv;
+  lv_canvas_set_buffer(cv, buf, SZ, SZ, LV_IMG_CF_TRUE_COLOR_ALPHA);
+  lv_canvas_fill_bg(cv, lv_color_black(), LV_OPA_TRANSP);
+  lv_draw_line_dsc_t ld; lv_draw_line_dsc_init(&ld);
+  ld.color = col; ld.width = 2; ld.round_start = ld.round_end = 1;
+  lv_draw_rect_dsc_t rd; lv_draw_rect_dsc_init(&rd);
+  rd.bg_opa = LV_OPA_TRANSP; rd.border_color = col; rd.border_width = 2; rd.border_opa = LV_OPA_COVER;
+  const lv_coord_t hh = (lv_coord_t)(SZ / 2);
+  const lv_coord_t ed = (lv_coord_t)(SZ - 2);
+  const lv_coord_t q1 = (lv_coord_t)(SZ / 4);
+  const lv_coord_t q3 = (lv_coord_t)(SZ - SZ / 4);
+  const lv_coord_t e3 = (lv_coord_t)(SZ - 3);
+  switch (shape) {
+    case 0: { lv_point_t p[4] = {{hh,1},{1,ed},{ed,ed},{hh,1}};            lv_canvas_draw_line(cv, p, 4, &ld); } break; // △
+    case 1: rd.radius = 4;               lv_canvas_draw_rect(cv, 1, 1, SZ-2, SZ-2, &rd); break;                        // □
+    case 2: rd.radius = LV_RADIUS_CIRCLE; lv_canvas_draw_rect(cv, 1, 1, SZ-2, SZ-2, &rd); break;                       // ○
+    case 3: { lv_point_t p[5] = {{q1,2},{q3,2},{ed,e3},{2,e3},{q1,2}};     lv_canvas_draw_line(cv, p, 5, &ld); } break; // ⏢ trapezoid
+    default:{ lv_point_t p[5] = {{hh,1},{ed,hh},{hh,ed},{1,hh},{hh,1}};    lv_canvas_draw_line(cv, p, 5, &ld); } break; // ◇
+  }
+  lv_obj_align(cv, LV_ALIGN_CENTER, 0, 0);
+  return cv;
+}
+// Re-skin an existing composer chip / floating button as a coloured F-key shape: strip its round
+// fill, draw the shape behind the icon, and tint a monochrome icon to match (a colour-emoji icon
+// keeps its own colours → pass tint_icon=false).
+static void styleChipAsFkey(lv_obj_t* btn, lv_obj_t* icon, int shape, uint32_t rgb, int SZ, bool tint_icon) {
+  if (!btn) return;
+  lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN);
+  lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+  lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
+  makeFkeyShape(btn, shape, rgb, SZ);
+  if (icon) {
+    lv_obj_move_foreground(icon);                                  // keep the glyph above the shape
+    if (shape == 0) lv_obj_align(icon, LV_ALIGN_CENTER, 0, SZ / 6);   // △: drop the glyph into the wider lower body so it fits
+    if (tint_icon) lv_obj_set_style_text_color(icon, lv_color_hex(rgb), LV_PART_MAIN);
+  }
+}
+#endif  // HAS_TANMATSU
+
 // ----- Chat detail (full-screen overlay on lv_scr_act) -------
 static void makeChatDetail(LvChatPanel& p) {
   p.overlay = lv_obj_create(lv_scr_act());
@@ -20222,6 +20928,14 @@ static void makeChatDetail(LvChatPanel& p) {
   lv_label_set_text(jlbl, LV_SYMBOL_DOWN);
   lv_obj_set_style_text_color(jlbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_center(jlbl);
+#if defined(HAS_TANMATSU)
+  // Purple ⏢ trapeze (matches the F6 hardware key). Keep a subtle dark backing so the
+  // outline + arrow stay legible while it floats over the message bubbles.
+  styleChipAsFkey(p.jump_btn, jlbl, 4, 0xC724B1, 40, true);   // ◇ — same shape as the menubar's purple key
+  lv_obj_set_style_bg_color(p.jump_btn, lv_color_hex(0x101113), LV_PART_MAIN);
+  lv_obj_set_style_bg_opa(p.jump_btn, LV_OPA_70, LV_PART_MAIN);
+  lv_obj_set_style_radius(p.jump_btn, 8, LV_PART_MAIN);
+#endif
   lv_obj_add_event_cb(p.jump_btn, jumpToLatestCb, LV_EVENT_CLICKED, &p);
   lv_obj_add_flag(p.jump_btn, LV_OBJ_FLAG_HIDDEN);
 
@@ -20257,6 +20971,9 @@ static void makeChatDetail(LvChatPanel& p) {
   lv_label_set_text(ql, LV_SYMBOL_LIST);
   lv_obj_set_style_text_font(ql, &g_font_14, LV_PART_MAIN);
   lv_obj_center(ql);
+#if defined(HAS_TANMATSU)
+  styleChipAsFkey(qr_btn, ql, 0, 0xF5A623, 30, true);    // orange △ — quick replies (F2)
+#endif
 
   // Emoji / special-character picker button (smiley). Opens the insert grid.
   lv_obj_t* emoji_btn = lv_btn_create(p.composer_row);
@@ -20270,15 +20987,22 @@ static void makeChatDetail(LvChatPanel& p) {
   lv_label_set_text(el, TR("\xF0\x9F\x98\x8A"));   // 😊
   lv_obj_set_style_text_font(el, &g_font_16, LV_PART_MAIN);
   lv_obj_center(el);
+#if defined(HAS_TANMATSU)
+  styleChipAsFkey(emoji_btn, el, 1, 0xFFD400, 30, false); // yellow □ — emoji picker (F3); keep the colour glyph
+#endif
+  // Channel settings lives on the TOP status-bar gear (styled as the green ○ key), not a
+  // composer chip — so the left chip row stays QR + emoji and the textarea geometry is fixed.
+  const lv_coord_t comp_ta_x = 72;
+  const lv_coord_t comp_ta_w = chatScreenW() - 120;
 
   p.composer_ta = lv_textarea_create(p.composer_row);
   // Fill the row between the two left chips and Send (right): content width is
   // screen - 8 (pad), minus QR(30)+gap(6)+Emoji(30)+gap(6) on the left and
   // gap(6)+Send(34) on the right => screen - 120. Widens with the screen.
-  lv_obj_set_size(p.composer_ta, chatScreenW() - 120, 30);
+  lv_obj_set_size(p.composer_ta, comp_ta_w, CHAT_COMP_H - 4);
   // 30 (QR) + 6 + 30 (Emoji) + 6 = 72 offset from content-left. Bottom-aligned so
   // the box grows UPWARD as the message wraps to more lines (chatComposerAutoGrow).
-  lv_obj_align(p.composer_ta, LV_ALIGN_BOTTOM_LEFT, 72, 0);
+  lv_obj_align(p.composer_ta, LV_ALIGN_BOTTOM_LEFT, comp_ta_x, 0);
   styleCard(p.composer_ta);
   lv_obj_set_style_radius(p.composer_ta, 15, LV_PART_MAIN);   // pill shape
   // Keep a few px of vertical slack in the textarea CONTENT so it never sits at
@@ -20866,8 +21590,8 @@ static void makeSettings(lv_obj_t* tab) {
   const lv_coord_t card_h = landscape ? 54 : 46;
 
   for (int c = 0; c < CAT_COUNT; ++c) {
-#if !defined(HAS_TDECK_GT911)
-    if (c == CAT_LOCK) continue;   // lock screen is a T-Deck-only feature
+#if !defined(HAS_TDECK_GT911) && !defined(HAS_TANMATSU)
+    if (c == CAT_LOCK) continue;   // lock screen is a T-Deck / Tanmatsu feature
 #endif
     lv_obj_t* card = lv_btn_create(land);
     lv_obj_remove_style_all(card);
@@ -20891,20 +21615,15 @@ static void makeSettings(lv_obj_t* tab) {
     lv_label_set_text(lbl, TR(kSettingsCats[c].label));
     lv_obj_set_style_text_font(lbl, &g_font_14, LV_PART_MAIN);
     lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
-    // Constrain + wrap so a long translated name (e.g. "Πληκτρολόγιο",
-    // "Schnellantworten") stays inside the card instead of running under the
-    // chevron / off the edge — tightest in landscape's narrow 2-column cards.
-    lv_obj_set_width(lbl, card_w - 40 - (landscape ? 14 : 30));
+    // Category name sits visually CENTRED in the card (icon stays a left accent).
+    // The label spans the card minus a symmetric margin (so the left accent icon
+    // never overlaps the text) and centre-aligns within that box; wrap keeps a long
+    // translated name (e.g. "Πληκτρολόγιο", "Schnellantworten") inside the card.
+    // No right chevron — it fought the centred text and pulled the eye off-centre.
+    lv_obj_set_width(lbl, card_w - 2 * 40);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 40, 0);
-
-    if (!landscape) {
-      lv_obj_t* chev = lv_label_create(card);
-      lv_label_set_text(chev, LV_SYMBOL_RIGHT);
-      lv_obj_set_style_text_font(chev, &g_font_14, LV_PART_MAIN);
-      lv_obj_set_style_text_color(chev, lv_color_hex(0x4A5D70), LV_PART_MAIN);
-      lv_obj_align(chev, LV_ALIGN_RIGHT_MID, -12, 0);
-    }
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(lbl, LV_ALIGN_CENTER, 0, 0);
 
     if (c == CAT_ABOUT) {   // update-available dot rides on the About card
       s_update_subtab_badge = lv_obj_create(card);
@@ -21043,8 +21762,13 @@ static void openTraceResultPopup(const char* title, const char* body) {
   lv_obj_clear_flag(s_trace_result_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_trace_result_root, traceResultBackdropCb, LV_EVENT_CLICKED, nullptr);
 
+#if defined(HAS_TANMATSU)
+  const int card_w = PSC(220);
+  const int card_h = PSC(236);
+#else
   const int card_w = 220;
   const int card_h = 236;
+#endif
   lv_obj_t* card = lv_obj_create(s_trace_result_root);
   lv_obj_remove_style_all(card);
   lv_obj_set_size(card, card_w, card_h);
@@ -21072,7 +21796,7 @@ static void openTraceResultPopup(const char* title, const char* body) {
   lv_label_set_text(lbl, body);
   lv_obj_set_style_text_color(lbl, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
   lv_obj_set_style_text_font(lbl, &g_font_12, LV_PART_MAIN);
-  lv_obj_set_pos(lbl, 0, 32);
+  lv_obj_set_pos(lbl, 0, PSC(32));
   lv_obj_add_flag(lbl, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(lbl, copyLabelLongPressCb, LV_EVENT_LONG_PRESSED,
                       const_cast<char*>("info"));
@@ -21236,12 +21960,22 @@ static void openMessageActionMenu(int msg_idx) {
   lv_obj_clear_flag(s_msg_menu_root, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_add_event_cb(s_msg_menu_root, msgMenuBackdropCb, LV_EVENT_CLICKED, nullptr);
 
+  // The 800×480 Tanmatsu dwarfs this 180-wide menu, so widen it and grow the
+  // rows; the smaller boards keep the historical integers (PSC is a no-op there).
+#if defined(HAS_TANMATSU)
+  const int card_w = PSC(180);
+  const int btn_h  = PSC(30);
+  const int gap    = PSC(4);
+  const int pad    = PSC(10);
+  const int hdr_h  = PSC(24);
+#else
   const int card_w = 180;
   const int btn_h  = 30;   // was 38 — the menu now carries up to 5 rows (Ack/Mention/Copy/Info/Block); shrink so they fit a 240-px screen
   const int gap    = 4;
   const int pad    = 10;
   // Header row reserves space for the close-X badge so it doesn't sit on a button.
   const int hdr_h  = 24;
+#endif
   const int nbtn   = (can_ack ? 1 : 0) + (can_mention ? 1 : 0) + 2 /*Copy+Info*/ + (can_block ? 1 : 0) + (can_resend ? 1 : 0);
   int card_h = hdr_h + nbtn * btn_h + (nbtn - 1) * gap + 2 * pad;
   // Never exceed the visible area under the status bar; scroll if it ever would
@@ -21365,8 +22099,13 @@ static void openMessageInfoPopup(int msg_idx) {
   const bool show_trace = !m.channel;
   const int  route_pts  = buildRouteFromMessage(m);
   const bool show_route = (route_pts >= 2);
+#if defined(HAS_TANMATSU)
+  const int card_w = PSC(220);
+  int card_h = (show_trace || show_route) ? PSC(290) : PSC(250);
+#else
   const int card_w = 220;
   int card_h = (show_trace || show_route) ? 290 : 250;
+#endif
   // Never taller than the screen; the body inside scrolls if it doesn't fit
   // (matters on the short 320x240 T-Deck in landscape).
   const int avail_h = sh - STATUSBAR_H - 8;
@@ -21516,9 +22255,9 @@ static void openMessageInfoPopup(int msg_idx) {
   // side-by-side when both apply, else full width.
   const int  content_h = card_h - 20;                  // card has pad_all = 10
   const bool has_btns  = (show_route || show_trace);
-  const int  btn_h     = 32;
-  const int  btn_row_y = 30;                            // just below the title
-  const int  body_top  = has_btns ? (btn_row_y + btn_h + 8) : 30;
+  const int  btn_h     = PSC(32);
+  const int  btn_row_y = PSC(30);                       // just below the title
+  const int  body_top  = has_btns ? (btn_row_y + btn_h + PSC(8)) : PSC(30);
 
   if (has_btns) {
     if (show_route && show_trace) {
@@ -21827,14 +22566,10 @@ static void refreshChatDetail(LvChatPanel& p) {
       lv_obj_set_width(tlbl, kInnerMaxW);
     }
     lv_obj_set_pos(tlbl, 0, inner_y);
-    // Long-press the bubble text → open the per-message action menu
-    // (Copy / Info). The absolute msg index is packed into user_data so the
-    // menu can pull the right entry out of the ring even after a refresh.
-    lv_obj_add_flag(tlbl, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(tlbl, bubbleLongPressMenuCb, LV_EVENT_LONG_PRESSED,
-                        reinterpret_cast<void*>((intptr_t)msg_idx[i]));
-    // ALSO attach to the bubble itself so the long-press still works if the
-    // user taps the bubble's padding rather than precisely on the text.
+    // Long-press the bubble → the per-message action menu (Copy / Info). The absolute msg
+    // index is packed into user_data so the menu pulls the right entry from the ring. ONLY
+    // the bubble is the clickable (not the inner text label), so keyboard-nav focuses +
+    // highlights the WHOLE bubble instead of just the text; a tap on the text bubbles up.
     lv_obj_add_flag(bubble, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(bubble, bubbleLongPressMenuCb, LV_EVENT_LONG_PRESSED,
                         reinterpret_cast<void*>((intptr_t)msg_idx[i]));
@@ -21907,11 +22642,10 @@ static void refreshChatDetail(LvChatPanel& p) {
     y_pos += bh + kRowGap;
   }
 
-  // On open with unread, land on the "new messages" divider (Discord-style)
-  // instead of the bottom; otherwise show the newest message. On a refresh while
-  // already open, follow new messages ONLY if the user was at the bottom — if
-  // they'd scrolled up to read history, stay where they were (don't yank them
-  // down). The jump-to-latest button is there to return to the bottom.
+  // On open, land on the "new messages" divider (the red line just above the first unread) so you
+  // pick up where you left off; with nothing unread, show the newest message. On a refresh while
+  // already open, follow new messages ONLY if you were already at the bottom — if you'd scrolled
+  // up to read history, stay put (the jump-to-latest button returns you to the bottom).
   lv_obj_update_layout(p.msgs);
   if (s_chat_just_opened && jump_y >= 0) {
     // Tapped an @mention: land on that exact message (a little context above it).
@@ -22391,8 +23125,17 @@ static void refreshContactsList() {
   const bool sel_md  = s_ct_select_mode;
   const int  ROW_H   = 34;
   const int  star_x  = row_w - 18;                       // ★ favorite marker (reserved on every row)
-  const int  loc_w   = 46, loc_x   = star_x - 4 - loc_w; // Location column (compact, pushed right)
-  const int  hrd_w   = 32, heard_x = loc_x - 2 - hrd_w;  // Heard column (compact, pushed right)
+  // Heard (age) + Location (distance) columns. On the narrow 240/320 boards the
+  // compact 32/46-px widths just fit; on the wide Tanmatsu (≥400 px) the values
+  // ("1.4km" / "390ft" / longer ages) looked cramped and ran together, so widen
+  // both columns and add a gap there. Labels below also get an explicit width so
+  // the text right-aligns within its column instead of bleeding into the next.
+  const bool wide_cols = (row_w >= 400);
+  const int  loc_w   = wide_cols ? 80 : 46;
+  const int  hrd_w   = wide_cols ? 64 : 32;
+  const int  col_gap = wide_cols ? 10 : 2;               // gap between the two columns
+  const int  loc_x   = star_x - (wide_cols ? 8 : 4) - loc_w;   // Location column (pushed right)
+  const int  heard_x = loc_x - col_gap - hrd_w;          // Heard column (left of Location)
   const int  icon_x  = sel_md ? 34 : 8;
   const int  name_x  = icon_x + 20;
   int        name_w  = heard_x - name_x - 6;
@@ -22480,18 +23223,25 @@ static void refreshContactsList() {
     lv_obj_set_style_text_color(nm, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
     lv_obj_align(nm, LV_ALIGN_LEFT_MID, name_x, 0);
 
-    // Heard column (12 px — smaller than the 14 px name — and pushed right)
+    // Heard column (12 px — smaller than the 14 px name — and pushed right).
+    // Explicit column width so a longer age never bleeds into the Location
+    // column; left-aligned within it like the rest of the row.
     lv_obj_t* hl = lv_label_create(rb);
     lv_label_set_text(hl, age_buf);
     lv_obj_set_style_text_font(hl, &g_font_12, LV_PART_MAIN);
     lv_obj_set_style_text_color(hl, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+    lv_obj_set_width(hl, hrd_w);
+    lv_label_set_long_mode(hl, LV_LABEL_LONG_CLIP);
     lv_obj_align(hl, LV_ALIGN_LEFT_MID, heard_x, 0);
 
-    // Location column
+    // Location column — explicit width so "1.4km" / "390ft" fit and don't
+    // overrun the favourite-star slot on the wide layout.
     lv_obj_t* ll = lv_label_create(rb);
     lv_label_set_text(ll, loc_buf);
     lv_obj_set_style_text_font(ll, &g_font_12, LV_PART_MAIN);
     lv_obj_set_style_text_color(ll, lv_color_hex(e.has_gps ? COLOR_SUB : 0x4A4E54), LV_PART_MAIN);
+    lv_obj_set_width(ll, loc_w);
+    lv_label_set_long_mode(ll, LV_LABEL_LONG_CLIP);
     lv_obj_align(ll, LV_ALIGN_LEFT_MID, loc_x, 0);
 
     // Favorite star
@@ -22907,8 +23657,9 @@ static int tabForKey(int key) {
   (void)key;
   return -1;
 }
+#endif  // HAS_TDECK_KEYBOARD (keyboard helpers; the lock screen below is top-level)
 
-#if defined(HAS_TDECK_GT911)
+#if defined(HAS_TDECK_GT911) || defined(HAS_TANMATSU)
 // ---- Lock screen -------------------------------------------------------------
 // A full-screen overlay (wallpaper + live clock + lock-state text) shown while
 // the T-Deck is hard-locked. The wallpaper is a JPEG decoded to RGB565; the
@@ -22940,7 +23691,9 @@ static uint8_t* lockscreenDecodeWallpaper(int* out_w, int* out_h) {
   // this path only runs for user-selected wallpapers.)
   fs::FS* fsp = &SPIFFS;
   const char* fp = path;
-  if (!strncmp(path, "sd:", 3)) { fsp = &SD; fp = path + 3; fmSdTryMount(); }   // mount on demand so the chosen SD wallpaper decodes
+#if defined(HAS_TDECK_GT911)
+  if (!strncmp(path, "sd:", 3)) { fsp = &SD; fp = path + 3; fmSdTryMount(); }   // mount on demand so the chosen SD wallpaper decodes (T-Deck SD only)
+#endif
 
   uint8_t* rgb = nullptr;
   if (fp && fp[0]) {
@@ -23095,7 +23848,11 @@ static void lockscreenShow() {
   lv_obj_align(st, LV_ALIGN_TOP_MID, 0, 190);
 
   lv_obj_t* hint = lv_label_create(s_lock_root);
+#if defined(HAS_TANMATSU)
+  lv_label_set_text(hint, TR("press Volume Down to unlock"));
+#else
   lv_label_set_text(hint, TR("hold the trackball to unlock"));
+#endif
   lv_obj_set_style_text_font(hint, &g_font_12, LV_PART_MAIN);
   lv_obj_set_style_text_color(hint, col, LV_PART_MAIN);
   lv_obj_set_style_text_opa(hint, LV_OPA_70, LV_PART_MAIN);
@@ -23123,7 +23880,10 @@ static void serviceLockscreen() {
   if (t > 0) { time_t tt = (time_t)t; struct tm v; localtime_r(&tt, &v); mm = v.tm_min; }
   if (mm != s_lock_clock_min) lockscreenUpdateClock();
 }
+#endif  // core lock screen (HAS_TDECK_GT911 || HAS_TANMATSU)
 
+#if defined(HAS_TDECK_KEYBOARD)   // re-enter the keyboard block the lock screen was carved out of
+#if defined(HAS_TDECK_GT911)   // wallpaper picker is SD/SPIFFS-backed -> T-Deck only
 // ---- Lock-screen wallpaper picker (lists JPEGs in internal /lock/ + SD) ----
 static lv_obj_t* s_lockwall_picker = nullptr;
 static char s_lockwall_paths[24][TOUCH_LOCK_WALLPAPER_MAXLEN];
@@ -23335,11 +24095,22 @@ static void backupAddPath(const char* stored, const char* disp) {
   strncpy(s_backup_disp [s_backup_count], disp,   47);  s_backup_disp [s_backup_count][47]  = '\0';
   s_backup_count++;
 }
+// Internal filesystem that holds the .json backups: FFat on the Tanmatsu (the launcher already
+// mounted the 'locfd' FAT data partition — SPIFFS isn't the writable store there, and FFat.begin()
+// would fail on an already-mounted volume), plain SPIFFS on the T-Deck / V4. Mirrors the file
+// manager's "Internal" root so a backup lands where the user can actually see + restore it.
+static fs::FS* backupInternalFs() {
+#if defined(HAS_TANMATSU)
+  return &FFat;
+#else
+  SPIFFS.begin(false);
+  return &SPIFFS;
+#endif
+}
 static void backupScan() {
   s_backup_count = 0;
-  // Internal SPIFFS is flat — list any *.json at the root.
-  SPIFFS.begin(false);
-  File root = SPIFFS.open("/");
+  // Internal flash is flat — list any *.json at the root (SPIFFS on T-Deck/V4, FFat on Tanmatsu).
+  File root = backupInternalFs()->open("/");
   if (root) {
     File e = root.openNextFile();
     while (e) {
@@ -23404,7 +24175,7 @@ static void doBackupImportChosen() {
   if (!g_lv.task || !s_backup_chosen[0]) return;
   fs::FS* fsp = nullptr;
   const char* path = s_backup_chosen;
-  if (!strncmp(path, "int:", 4)) { SPIFFS.begin(false); fsp = &SPIFFS; path += 4; }
+  if (!strncmp(path, "int:", 4)) { fsp = backupInternalFs(); path += 4; }
 #if defined(HAS_TDECK_GT911)
   else if (!strncmp(path, "sd:", 3)) { fsp = &SD; path += 3; }
 #endif
@@ -23568,7 +24339,7 @@ static void doExportBackupFile(const char* fname) {
   // mounts it) so a backup truly lands on — and lists from — the SD card.
   if (fmSdTryMount()) { f = SD.open(path, FILE_WRITE); if (f) where = "SD"; }
 #endif
-  if (!f) { SPIFFS.begin(false); f = SPIFFS.open(path, FILE_WRITE); }
+  if (!f) { f = backupInternalFs()->open(path, FILE_WRITE); }
   if (!f) { lv_obj_del(ov); g_lv.task->showAlert(TR("Export failed (can't open file)"), 1800); return; }
   { WdtHeavyGuard _wg;   // a 60 KB backup write to internal flash can trigger a SPIFFS GC
     { FileBufWriter bw(f);
@@ -23698,6 +24469,29 @@ static void buildBackupsSettings() {
     lv_obj_center(el);
     y += SC(48);
   }
+
+#if defined(HAS_TANMATSU)
+  // Import a saved backup right here. The T-Deck / V4 reach the picker via the Identity page's
+  // "Import settings" button; the Tanmatsu surfaces it next to Export so the whole round-trip
+  // (export a .json, then restore it) lives on one page. Opens the same internal+SD .json picker.
+  {
+    lv_obj_t* ib = lv_btn_create(body);
+    lv_obj_set_size(ib, cw, SC(40));
+    lv_obj_set_pos(ib, 0, y);
+    styleButton(ib);
+    lv_obj_add_event_cb(ib, +[](lv_event_t* e) {
+      if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+      openBackupPicker();
+    }, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* il = lv_label_create(ib);
+    char iblbl[56]; snprintf(iblbl, sizeof iblbl, LV_SYMBOL_DOWNLOAD "  %s", TR("Import backup"));
+    lv_label_set_text(il, iblbl);
+    lv_obj_set_style_text_font(il, &g_font_14, LV_PART_MAIN);
+    lv_obj_set_style_text_color(il, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+    lv_obj_center(il);
+    y += SC(48);
+  }
+#endif
 
   y += settingsRowLabel(body, y, 0, "Saved backups", COLOR_SUB, &g_font_12, 0) + 4;
 
@@ -24442,6 +25236,13 @@ static void ccGpsCb(lv_event_t* e) {
   g_lv.task->showAlert(g_lv.task->getGPSState() ? TR("GPS on") : TR("GPS off"), 800);
   openControlCenter();   // rebuild so the toggle reflects the new state
 }
+#if defined(HAS_TANMATSU)
+// No onboard GPS on the Tanmatsu — the chip is info-only (doesn't toggle anything).
+static void ccGpsNoneCb(lv_event_t* e) {
+  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+  g_lv.task->showAlert(TR("No onboard GPS"), 1200);
+}
+#endif
 // Theme-colour chip (both boards): close the control center, open the accent picker.
 static void ccThemeCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -24449,7 +25250,7 @@ static void ccThemeCb(lv_event_t* e) {
   openAccentPicker();
 }
 
-#if defined(HAS_TDECK_KEYBOARD)
+#if defined(HAS_TDECK_KEYBOARD) || defined(HAS_TANMATSU)
 static void ccKbBacklightCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
   s_kb_bl_mode = (uint8_t)((s_kb_bl_mode + 1) % 3);   // off -> on -> auto -> off
@@ -24468,13 +25269,19 @@ static void ccLockCb(lv_event_t* e) {
   g_lv.task->lockScreen();
 }
 #endif
-#if defined(HAS_UI_SOUND)
-// Sound on/off chip (T-Deck I2S speaker / Heltec V4 piezo). Confirmation chime on enable.
+#if defined(HAS_UI_SOUND) || defined(HAS_TANMATSU)
+// Sound on/off chip (T-Deck I2S speaker / Heltec V4 piezo / Tanmatsu ES8156). Confirmation chime on enable.
 static void ccSoundCb(lv_event_t* e) {
   if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
   g_lv.task->toggleBuzzer();
   const bool quiet = g_lv.task->isBuzzerQuiet();
-  if (!quiet) uiPlayNotify();
+  if (!quiet) {
+#if defined(HAS_TANMATSU)
+    tanBeep();
+#else
+    uiPlayNotify();
+#endif
+  }
   openControlCenter();   // rebuild so the chip's active state updates
 }
 #endif
@@ -24693,14 +25500,82 @@ static void applyBrightness(uint8_t pct) {
   ledcWrite(kBlPwmChannel, (uint32_t)pct * 255u / 100u);
 }
 #elif defined(HAS_TANMATSU)
-// Tanmatsu: the panel backlight is set by the bsp (CH32 coprocessor), not LEDC.
-#define HAS_CC_BRIGHTNESS 1
+// Tanmatsu: backlights + audio go through the bsp — the CH32 coprocessor (screen +
+// keyboard backlight) and the ES8156 codec / speaker amp (volume). Three CC sliders.
+#define HAS_CC_BRIGHTNESS    1
+#define HAS_CC_KBD_BACKLIGHT 1
+#define HAS_CC_VOLUME        1
 static uint8_t s_brightness_pct = 100;
-static void applyBrightness(uint8_t pct) {
+static void applyBrightness(uint8_t pct) {        // SCREEN backlight (bsp_display; was wrongly the keyboard)
   if (pct < 5)   pct = 5;
   if (pct > 100) pct = 100;
-  s_brightness_pct = pct;
-  bsp_input_set_backlight_brightness(pct);
+  s_brightness_pct = pct;                          // store the slider value (5..100)
+  // This panel looks ~max by ~25-30% backlight duty and must never go fully black, so map
+  // the slider LINEARLY onto a [FLOOR..CEIL] duty band: every step is visible, the top is
+  // max-useful, and the bottom stays clearly lit. (Tune FLOOR/CEIL to taste.)
+  const int FLOOR = 6, CEIL = 28;    // dim-but-lit … perceived-max; the visible range lives down low
+  uint32_t duty = FLOOR + (uint32_t)(pct - 5) * (CEIL - FLOOR) / 95;
+  bsp_display_set_backlight_brightness((uint8_t)duty);
+}
+static uint8_t s_kbd_bl_pct = 100;
+// Stores the Keys-slider brightness only; the hardware is driven per-loop by
+// tanKbBacklightTick() so the off/on/auto mode (s_kb_bl_mode) is honoured.
+static void applyKbdBacklight(uint8_t pct) {      // keyboard backlight (CH32 coprocessor)
+  if (pct > 100) pct = 100;
+  s_kbd_bl_pct = pct;
+}
+// Drive the keyboard backlight from mode + Keys-slider brightness: off → dark,
+// on → slider brightness, auto → slider brightness while recently active then dark.
+// (Screen-off forcing to 0 is handled by the caller in the apply loop.)
+static void tanKbBacklightTick(bool off = false) {
+  uint8_t v = 0;
+  if (!off) {
+    if (s_kb_bl_mode == 1) v = s_kbd_bl_pct;
+    else if (s_kb_bl_mode == 2 && (millis() - s_kb_last_key_ms) < kKbBacklightIdleMs) v = s_kbd_bl_pct;
+  }
+  static uint8_t s_last = 0xFF;   // per-frame caller: only hit the CH32 over I2C when it changes
+  if (v != s_last) { s_last = v; bsp_input_set_backlight_brightness(v); }
+}
+static uint8_t s_volume_pct = 70;
+// The audio subsystem (ES8156 codec + I2S) is brought up by bsp_device_initialize()
+// at boot — so here we only set the codec volume and toggle the speaker amplifier.
+static void applyVolume(uint8_t pct) {
+  if (pct > 100) pct = 100;
+  s_volume_pct = pct;                              // store the slider value
+  // The bottom ~half of the codec's range sits below the speaker's audible threshold,
+  // so map the slider into the audible band (≈50..100% of the codec) and mute at 0.
+  bsp_audio_set_volume(pct == 0 ? 0.0f : 50.0f + (float)pct * 0.5f);
+  bsp_audio_set_amplifier(pct > 0);
+}
+// Short sine "tick" through the I2S codec so adjusting the volume slider is audible.
+// The codec's I2S DMA REPLAYS its last buffer on TX underrun (no auto-clear), so a bare
+// tone would loop forever — we follow it with a block of silence LARGER than the DMA ring,
+// which leaves every descriptor zeroed once played out, and the tone stops cleanly.
+static void tanBeep() {
+  if (s_volume_pct == 0) return;
+  static uint32_t s_last_beep = 0;             // throttle: holding the slider ramps fast, but
+  if (millis() - s_last_beep < 200) return;    // don't machine-gun a tone on every repeat step
+  s_last_beep = millis();
+  i2s_chan_handle_t h = nullptr;
+  if (bsp_audio_get_i2s_handle(&h) != ESP_OK || !h) return;
+  const int rate = 44100, freq = 880;
+  const int tone  = rate * 30 / 1000;             // ~30 ms tone …
+  const int total = tone + rate * 50 / 1000;      // … then ~50 ms silence (> the DMA ring) flushes the loop
+  const int fade  = rate * 4 / 1000;              // 4 ms in/out fade kills the click
+  static int16_t buf[3600 * 2];                   // stereo (L,R), ~80 ms — the P4 has RAM to spare
+  const int n = total > 3600 ? 3600 : total;
+  for (int i = 0; i < n; i++) {
+    int16_t s = 0;
+    if (i < tone) {
+      float env = 1.0f;
+      if (i < fade)              env = (float)i / fade;
+      else if (i >= tone - fade) env = (float)(tone - i) / fade;
+      s = (int16_t)(9000.0f * env * sinf(2.0f * 3.14159265f * freq * i / rate));
+    }
+    buf[2 * i] = buf[2 * i + 1] = s;
+  }
+  size_t wr = 0;
+  i2s_channel_write(h, buf, (size_t)n * 2 * sizeof(int16_t), &wr, 200 / portTICK_PERIOD_MS);
 }
 #endif
 
@@ -24710,6 +25585,24 @@ static void ccBrightnessCb(lv_event_t* e) {
 }
 static void ccBrightnessReleaseCb(lv_event_t* e) {
   touchPrefsSetBrightness((uint8_t)lv_slider_get_value(lv_event_get_target(e)));  // persist
+}
+#endif
+#if defined(HAS_CC_KBD_BACKLIGHT)
+static void ccKbdBlCb(lv_event_t* e) {
+  applyKbdBacklight((uint8_t)lv_slider_get_value(lv_event_get_target(e)));
+  if (s_kb_bl_mode == 0) s_kb_bl_mode = 1;   // adjusting brightness from "off" turns it on so the change is visible
+  tanKbBacklightTick();                       // immediate feedback at the new brightness
+}
+static void ccKbdBlReleaseCb(lv_event_t* e) {
+  touchPrefsSetKbdBacklight((uint8_t)lv_slider_get_value(lv_event_get_target(e)));
+  touchPrefsSetKbBacklight(s_kb_bl_mode);     // persist the (possibly flipped) mode so it sticks
+}
+#endif
+#if defined(HAS_CC_VOLUME)
+static void ccVolumeCb(lv_event_t* e)        { applyVolume((uint8_t)lv_slider_get_value(lv_event_get_target(e))); }   // live codec volume
+static void ccVolumeReleaseCb(lv_event_t* e) {
+  touchPrefsSetSoundVolume((uint8_t)lv_slider_get_value(lv_event_get_target(e)));   // persist
+  tanBeep();                                                                        // audible feedback at the chosen level
 }
 #endif
 
@@ -24739,7 +25632,7 @@ static void openControlCenter() {
   lv_obj_t* card = lv_obj_create(s_cc_root);
   lv_obj_remove_style_all(card);
 #if defined(HAS_TANMATSU)
-  lv_obj_set_size(card, card_w, 312);   // way bigger: header + brightness + 2×2 toggle grid + sysinfo
+  lv_obj_set_size(card, card_w, 384);   // bigger: header + 3 roomier sliders + toggle grid + sysinfo
 #elif defined(HAS_TDECK_GT911)
   lv_obj_set_size(card, card_w, 200);   // sysinfo + thin brightness slider + 2-row toggle grid (fits 240−22 screen)
 #else
@@ -24825,7 +25718,10 @@ static void openControlCenter() {
   // Brightness slider takes the first row (just under the date / battery) and the
   // GPS line follows it, so the slider sits ABOVE the GPS line. Boards without a
   // backlight PWM have no slider, so GPS reclaims that first row.
-#if defined(HAS_CC_BRIGHTNESS)
+#if defined(HAS_TANMATSU)
+  const int bl_y  = row_y;             // three stacked sliders: Screen / Keys / Sound
+  const int gps_y = row_y + SC(100);   // GPS line sits below all three (scaled so it clears taller sliders)
+#elif defined(HAS_CC_BRIGHTNESS)
   const int bl_y  = row_y;
   const int gps_y = row_y + 12;
 #else
@@ -24855,7 +25751,36 @@ static void openControlCenter() {
   }
 #endif
 
-#if defined(HAS_CC_BRIGHTNESS)
+#if defined(HAS_TANMATSU)
+  // ---- Three stacked sliders: Screen brightness, Keyboard backlight, Volume.
+  //      A short text label on the left (tofu-proof, no glyph) anchors each thin bar.
+  {
+    struct { const char* name; int val; int lo; lv_event_cb_t live; lv_event_cb_t done; } sl[3] = {
+      { "Screen", s_brightness_pct, 5, ccBrightnessCb, ccBrightnessReleaseCb },
+      { "Keys",   s_kbd_bl_pct,     0, ccKbdBlCb,      ccKbdBlReleaseCb },
+      { "Sound",  s_volume_pct,     0, ccVolumeCb,     ccVolumeReleaseCb },
+    };
+    for (int i = 0; i < 3; i++) {
+      const int y = bl_y + i * SC(30);   // roomier vertical spacing (scales with UI size so rows don't stack-overlap)
+      lv_obj_t* lab = lv_label_create(card);
+      lv_label_set_text(lab, sl[i].name);
+      lv_obj_set_style_text_font(lab, &g_font_12, LV_PART_MAIN);
+      lv_obj_set_style_text_color(lab, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
+      lv_obj_align(lab, LV_ALIGN_TOP_LEFT, 0, y - 1);
+      lv_obj_t* s = lv_slider_create(card);
+      lv_obj_set_size(s, card_w - 20 - SC(70), 10);    // reserve SC()-scaled room for the label so a bigger
+                                                       // UI-scale label can't overlap the bar
+      lv_obj_align(s, LV_ALIGN_TOP_RIGHT, 0, y);
+      lv_slider_set_range(s, sl[i].lo, 100);
+      lv_slider_set_value(s, sl[i].val, LV_ANIM_OFF);
+      lv_obj_set_style_bg_color(s, lv_color_hex(COLOR_ACCENT), LV_PART_INDICATOR);
+      lv_obj_set_style_bg_color(s, lv_color_hex(COLOR_ACCENT), LV_PART_KNOB);
+      lv_obj_set_style_pad_all(s, 4, LV_PART_KNOB);
+      lv_obj_add_event_cb(s, sl[i].live, LV_EVENT_VALUE_CHANGED, nullptr);
+      lv_obj_add_event_cb(s, sl[i].done, LV_EVENT_RELEASED,      nullptr);
+    }
+  }
+#elif defined(HAS_CC_BRIGHTNESS)
   // ---- Brightness slider (thin; a sun/gear glyph anchors it on the left so it
   //      doesn't cost a separate label row). bl_y is computed above so it sits
   //      directly under the date/battery, just above the GPS line.
@@ -24931,8 +25856,8 @@ static void openControlCenter() {
   // with even gaps (5 chips + 4 gaps across the content width).
   int tw = 66, th = 54;
 #if defined(HAS_TANMATSU)
-  tw = (card_w - 20 - 10) / 2;   // 2 big chips per row (Wi-Fi/BT/GPS/Theme → 2×2 grid)
-  if (tw > 270) tw = 270;
+  tw = (card_w - 20 - 20) / 3;   // 3 chips per row (Wi-Fi/BT/GPS/Theme/Keys/Sound → 2×3 grid)
+  if (tw > 175) tw = 175;
   th = 80;
 #elif defined(HAS_TDECK_GT911)
   tw = 58; th = 36;
@@ -24945,9 +25870,13 @@ static void openControlCenter() {
   ccToggle(row, LV_SYMBOL_WIFI, "Wi-Fi", wifi_on, ccWifiCb, tw, th, CAT_WIFI);
   if (!g_lv.task || g_lv.task->hasBleCapability())
     ccToggle(row, LV_SYMBOL_BLUETOOTH, "BT", ble_on, ccBleCb, tw, th, CAT_BLUETOOTH);
+#if defined(HAS_TANMATSU)
+  ccToggle(row, LV_SYMBOL_GPS, "GPS", false, ccGpsNoneCb, tw, th, -1);   // no onboard GPS — info-only, untoggable
+#else
   ccToggle(row, LV_SYMBOL_GPS, "GPS", gps_on, ccGpsCb, tw, th, CAT_RADIO);
+#endif
   ccToggle(row, LV_SYMBOL_TINT, "Theme", false, ccThemeCb, tw, th, CAT_DISPLAY);
-#if defined(HAS_TDECK_KEYBOARD)
+#if defined(HAS_TDECK_KEYBOARD) || defined(HAS_TANMATSU)
   ccToggle(row, LV_SYMBOL_KEYBOARD,
            s_kb_bl_mode == 0 ? "off" : (s_kb_bl_mode == 1 ? "on" : "auto"),
            s_kb_bl_mode != 0, ccKbBacklightCb, tw, th, CAT_KEYBOARD);
@@ -24955,8 +25884,8 @@ static void openControlCenter() {
 #if defined(HAS_TDECK_GT911)
   ccToggle(row, LV_SYMBOL_EYE_OPEN, "Lock", false, ccLockCb, tw, th, CAT_LOCK);
 #endif
-#if defined(HAS_UI_SOUND)
-  // Sound on/off (notification tones — T-Deck I2S speaker / Heltec V4 piezo).
+#if defined(HAS_UI_SOUND) || defined(HAS_TANMATSU)
+  // Sound on/off (notification tones — T-Deck I2S speaker / Heltec V4 piezo / Tanmatsu ES8156).
   const bool sound_on = g_lv.task && !g_lv.task->isBuzzerQuiet();
   ccToggle(row, LV_SYMBOL_AUDIO, "Sound", sound_on, ccSoundCb, tw, th, CAT_SOUND);
 #endif
@@ -25060,10 +25989,10 @@ static void openThreadDetailByIdx(int idx, bool channel) {
     copyUtf8ReplacingMissingGlyphs(&g_font_12, san, sizeof(san), name);
     setChatStatusTitle(san);
   }
-  refreshChatDetail(p);
   p.detail_open = true;
   hideKb();
   if (p.overlay) { lv_obj_clear_flag(p.overlay, LV_OBJ_FLAG_HIDDEN); lv_obj_move_foreground(p.overlay); }
+  refreshChatDetail(p);   // AFTER un-hiding so bubbles measure correctly and the open-scroll reaches the newest message
 #if defined(HAS_TDECK_KEYBOARD)
   showKb(&p);          // physical keyboard: auto-focus the composer so typing goes straight in
 #elif defined(HAS_TANMATSU)
@@ -25825,6 +26754,15 @@ static void buildGlobalStatusBar() {
   lv_obj_set_ext_click_area(g_statusbar.chan_gear, 10);
   lv_obj_add_flag(g_statusbar.chan_gear, LV_OBJ_FLAG_HIDDEN);
   lv_obj_add_event_cb(g_statusbar.chan_gear, channelGearCb, LV_EVENT_CLICKED, nullptr);
+#if defined(HAS_TANMATSU)
+  // Ring the channel-settings gear with the green ○ key colour (matches the green F4 hardware key
+  // that opens channel settings in-chat). Keep the gear GLYPH white — only the ring is green.
+  lv_obj_set_style_text_color(g_statusbar.chan_gear, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
+  lv_obj_set_style_pad_all(g_statusbar.chan_gear, 2, LV_PART_MAIN);
+  lv_obj_set_style_border_color(g_statusbar.chan_gear, lv_color_hex(0x2ECC40), LV_PART_MAIN);
+  lv_obj_set_style_border_width(g_statusbar.chan_gear, 2, LV_PART_MAIN);
+  lv_obj_set_style_radius(g_statusbar.chan_gear, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+#endif
 
   // Right zone, anchored to the right edge (from rightmost to leftmost):
   // battery icon, battery %, signal bars, Wi-Fi, Bluetooth, clock. Compact spacings.
@@ -25958,7 +26896,11 @@ static void updateGlobalStatusBar() {
     if (in_chan_chat) lv_obj_clear_flag(g_statusbar.chan_gear, LV_OBJ_FLAG_HIDDEN);
     else              lv_obj_add_flag(g_statusbar.chan_gear, LV_OBJ_FLAG_HIDDEN);
   }
+#if defined(HAS_TANMATSU)
+  lv_obj_align(g_statusbar.left_label, LV_ALIGN_LEFT_MID, in_chan_chat ? 46 : 6, 0);   // clear the green-ringed gear with breathing room
+#else
   lv_obj_align(g_statusbar.left_label, LV_ALIGN_LEFT_MID, in_chan_chat ? 24 : 6, 0);
+#endif
 
   // The home tab shows the user's profile name in a fixed ~11-char window that
   // marquee-scrolls when it's longer. These track that config so we (a) reset it
@@ -26155,6 +27097,18 @@ static void updateGlobalStatusBar() {
       // The % column disappears while charging (bolt only), so slide everything
       // left of the battery rightward to keep it snug against the bolt — else a
       // %-wide gap opens between the signal bars and the lightning glyph.
+#if defined(HAS_TANMATSU)
+      // Tanmatsu: the cluster is built with SC() UI-scaling, so this slide MUST scale too — the raw
+      // offsets below marched the scaled glyphs (incl. the BLE icon) into each other at Large/Huge the
+      // instant charging toggled. Bases match the SC() builder; the clock is re-placed (SC-scaled) by
+      // the clock-placement block just below, and sleep_icon is T-Deck-only, so both are omitted here.
+      const int d = charging ? SC(32) : 0;
+      if (g_statusbar.sig_box)      lv_obj_align(g_statusbar.sig_box,      LV_ALIGN_RIGHT_MID, -SC(54)  + d, 0);
+      if (g_statusbar.conn_icon)    lv_obj_align(g_statusbar.conn_icon,    LV_ALIGN_RIGHT_MID, -SC(73)  + d, 0);
+      if (g_statusbar.sd_icon)      lv_obj_align(g_statusbar.sd_icon,      LV_ALIGN_RIGHT_MID, -SC(91)  + d, 0);
+      if (g_statusbar.ble_icon)     lv_obj_align(g_statusbar.ble_icon,     LV_ALIGN_RIGHT_MID, -SC(111) + d, 0);
+      if (g_statusbar.layout_label) lv_obj_align(g_statusbar.layout_label, LV_ALIGN_RIGHT_MID, -SC(182) + d, 0);
+#else
       const int d = charging ? 32 : 0;
       // Base offsets MUST match the builder (which shifted for the SD LED): the
       // SD dot is at -91, ble -111, clock -126, layout -166. The dot slides with
@@ -26166,6 +27120,7 @@ static void updateGlobalStatusBar() {
       if (g_statusbar.clock)        lv_obj_align(g_statusbar.clock,        LV_ALIGN_RIGHT_MID, -142 + d, 0);
       if (g_statusbar.layout_label) lv_obj_align(g_statusbar.layout_label, LV_ALIGN_RIGHT_MID, -182 + d, 0);
       if (g_statusbar.sleep_icon)   lv_obj_align(g_statusbar.sleep_icon,   LV_ALIGN_RIGHT_MID, -105 + d, 0);
+#endif
     }
     s_last_pct = pct;
     s_last_charging = charging;
@@ -26217,10 +27172,18 @@ static void updateGlobalStatusBar() {
       else {
         // The narrow V4 portrait bar (<300 px) has no sleep-moon slot, so the clock must sit at
         // its intended -126 build position; the wide-bar -142 ran it into the width-capped
-        // node-name window on the left (the long-standing "clock overlaps the name" bug). The
-        // wide T-Deck / Tanmatsu bars keep -142. Charging slides it +32 as the % column hides.
+        // node-name window on the left (the long-standing "clock overlaps the name" bug). Charging
+        // slides it +32 as the % column hides.
+        //
+        // Wide bar (T-Deck / Tanmatsu): the right-side icon cluster is laid out with SC() scaling
+        // (ble at -SC(111/127)), but the old wide clk_x was a RAW -142 — so at Large/Huge UI scale
+        // the icons marched left PAST the un-scaled clock and the wide "12:05 PM" clock overran the
+        // battery / Wi-Fi / BLE icons. Scale the wide clock with SC() too so it tracks the cluster at
+        // every UI scale (identical to the old -142/-110 at 100%, no node-name regression). Narrow
+        // bar keeps its raw values (it was tuned for the V4 portrait layout at 100% only).
         const bool narrow_bar = lv_disp_get_hor_res(nullptr) < 300;
-        const int clk_x = narrow_bar ? (charging ? -94 : -126) : (charging ? -110 : -142);
+        const int clk_x = narrow_bar ? (charging ? -94 : -126)
+                                     : (charging ? -SC(110) : -SC(142));
         lv_obj_align(g_statusbar.clock, LV_ALIGN_RIGHT_MID, clk_x, 0);
       }
       // Park the async-request spinner just LEFT of the clock wherever it lands,
@@ -26235,6 +27198,11 @@ static void updateGlobalStatusBar() {
     if (keyboardLayoutsAnySecondary()) {
       const char* name = keyboardLayoutName(keyboardLayoutsGetCurrent());
       lv_label_set_text(g_statusbar.layout_label, name);
+#if defined(HAS_TANMATSU)
+      // Park it just left of the clock so it tracks the SC()-scaled icon cluster at any UI size. Its
+      // fixed build offset was unscaled, so at Large/Huge the scaled BLE glyph marched into it.
+      lv_obj_align_to(g_statusbar.layout_label, g_statusbar.clock, LV_ALIGN_OUT_LEFT_MID, -SC(8), 0);
+#endif
       lv_obj_clear_flag(g_statusbar.layout_label, LV_OBJ_FLAG_HIDDEN);
     } else {
       lv_obj_add_flag(g_statusbar.layout_label, LV_OBJ_FLAG_HIDDEN);
@@ -27485,10 +28453,10 @@ static void openChannelScopeModal(int slot, const char* name) {
   lv_label_set_text(title, TR("Channel settings"));
   lv_obj_set_style_text_font(title, &g_font_16, LV_PART_MAIN);
   lv_obj_set_style_text_color(title, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
-  lv_obj_set_pos(title, 8, 8);
+  lv_obj_set_pos(title, SC(8), SC(8));
 
   lv_obj_t* close = lv_btn_create(s_chanscope_modal);
-  lv_obj_set_size(close, 30, 26);
+  lv_obj_set_size(close, SC(30), SC(26));
   lv_obj_align(close, LV_ALIGN_TOP_RIGHT, -6, 4);
   styleButton(close);
   lv_obj_add_event_cb(close, chanScopeCloseCb, LV_EVENT_CLICKED, nullptr);
@@ -27501,19 +28469,19 @@ static void openChannelScopeModal(int slot, const char* name) {
   lv_obj_set_width(nm, sw - 16);
   lv_obj_set_style_text_color(nm, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(nm, &g_font_12, LV_PART_MAIN);
-  lv_obj_set_pos(nm, 8, 36);
+  lv_obj_set_pos(nm, SC(8), SC(36));
 
   lv_obj_t* hint = lv_label_create(s_chanscope_modal);
   lv_label_set_text(hint, TR("Region scope (#tag) for this channel.\nBlank = use the default scope."));
   lv_obj_set_style_text_color(hint, lv_color_hex(COLOR_SUB), LV_PART_MAIN);
   lv_obj_set_style_text_font(hint, &g_font_12, LV_PART_MAIN);
-  lv_obj_set_pos(hint, 8, 56);
+  lv_obj_set_pos(hint, SC(8), SC(56));
 
   s_chanscope_ta = lv_textarea_create(s_chanscope_modal);
   lv_textarea_set_one_line(s_chanscope_ta, true);
   lv_textarea_set_max_length(s_chanscope_ta, TOUCH_REGION_SCOPE_MAXLEN - 1);
-  lv_obj_set_size(s_chanscope_ta, sw - 16, 36);
-  lv_obj_set_pos(s_chanscope_ta, 8, 92);
+  lv_obj_set_size(s_chanscope_ta, sw - 16, SC(36));
+  lv_obj_set_pos(s_chanscope_ta, SC(8), SC(92));
 #if defined(ESP32)
   { char cur[TOUCH_REGION_SCOPE_MAXLEN] = {0};
     char def[TOUCH_REGION_SCOPE_MAXLEN] = {0};
@@ -27527,21 +28495,24 @@ static void openChannelScopeModal(int slot, const char* name) {
   attachSettingsTaEvents(s_chanscope_ta);
 
   lv_obj_t* save = lv_btn_create(s_chanscope_modal);
-  lv_obj_set_size(save, 120, 34);
-  lv_obj_set_pos(save, 8, 136);
+  lv_obj_set_size(save, SC(120), SC(34));
+  lv_obj_set_pos(save, SC(8), SC(136));
   styleButton(save);
   lv_obj_add_event_cb(save, chanScopeSaveCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* sl = lv_label_create(save); lv_label_set_text(sl, TR("Save")); lv_obj_center(sl);
 
   lv_obj_t* blk = lv_btn_create(s_chanscope_modal);
-  lv_obj_set_size(blk, sw - 16, 34);
-  lv_obj_set_pos(blk, 8, 182);
+  lv_obj_set_size(blk, sw - 16, SC(34));
+  lv_obj_set_pos(blk, SC(8), SC(182));
   styleButton(blk);
   lv_obj_add_event_cb(blk, chanScopeBlockedCb, LV_EVENT_CLICKED, nullptr);
   lv_obj_t* bl = lv_label_create(blk); lv_label_set_text(bl, TR("Blocked users")); lv_obj_center(bl);
 }
-static void channelGearCb(lv_event_t* e) {
-  if (lv_event_get_code(e) != LV_EVENT_CLICKED || !g_lv.task) return;
+// Open settings for the currently-active chat: per-channel region scope for a channel (or the
+// blocked-users manager if its slot is unknown / it's a DM). Shared by the status-bar gear, the
+// composer's green ○ chip, and the green F4 hardware key on the Tanmatsu.
+static void openActiveChatSettings() {
+  if (!g_lv.task) return;
   if (g_lv.task->activeThreadIsChannel()) {
     int slot = g_lv.task->activeChannelSlot();
     if (slot >= 0) openChannelScopeModal(slot, s_chat_title);
@@ -27549,6 +28520,9 @@ static void channelGearCb(lv_event_t* e) {
   } else {
     openBlockedUsersModal();                   // DM gear → straight to the blocked-users manager
   }
+}
+static void channelGearCb(lv_event_t* e) {
+  if (lv_event_get_code(e) == LV_EVENT_CLICKED) openActiveChatSettings();
 }
 
 // Full-screen pickers sit on lv_layer_top, but the swipe/gesture handler is global
@@ -30430,6 +31404,21 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
                   (int)SD.cardType());
   }
 #endif
+#if defined(HAS_TANMATSU)
+  // Tanmatsu's 16M.csv has no dedicated "tiles" partition (and no SPIFFS/SD), so the
+  // LittleFS mount above fails. Rather than surface a "reflash the partition" error,
+  // fall back to the internal FFat ('locfd') data partition the file browser already
+  // uses — Wi-Fi-fetched tiles cache to /tiles/<z>/<x>/<y>.jpg there and render exactly
+  // like the partition/SD backends (the render + fetch paths are fs-agnostic via the
+  // tileCache* helpers). Same "this board uses FFat" precedent as the chat-history store
+  // (s_ui_data_fs = &FFat). Network-only in practice: empty until Wi-Fi downloads tiles.
+  else if (g_fs_ok) {
+    s_tile_fs        = &FFat;
+    s_tile_root[0]   = '\0';   // -> /tiles/<z>/<x>/<y>.jpg, a self-contained dir on locfd
+    s_tiles_fs_ready = true;
+    Serial.println("[TILE] no tiles partition -> caching Wi-Fi tiles on FFat /tiles (Tanmatsu)");
+  }
+#endif
   else {
     s_tile_fs = nullptr;   // no cache backend at all -> map shows the storage notice
   }
@@ -30681,7 +31670,13 @@ void UITask::begin(DisplayDriver* display, SensorManager* sensors, NodePrefs* no
 #if defined(HAS_CC_BRIGHTNESS)
     applyBrightness(touchPrefsGetBrightness());
 #endif
-#if defined(HAS_TDECK_KEYBOARD)
+#if defined(HAS_CC_KBD_BACKLIGHT)
+    applyKbdBacklight(touchPrefsGetKbdBacklight());
+#endif
+#if defined(HAS_CC_VOLUME)
+    applyVolume(touchPrefsGetSoundVolume());   // codec already up via bsp_device_initialize
+#endif
+#if defined(HAS_TDECK_KEYBOARD) || defined(HAS_TANMATSU)
     s_kb_bl_mode = touchPrefsGetKbBacklight();
 #endif
     // Accent-popup picker (both boards: on-screen + physical keyboard). Default on.
@@ -31061,12 +32056,12 @@ void UITask::openMeshContactDm(uint32_t mesh_contact_index) {
     copyUtf8ReplacingMissingGlyphs(&g_font_12, san, sizeof(san), c.name);
     setChatStatusTitle(san);   // contact name → status bar (no in-chat header bar)
   }
-  refreshChatDetail(g_lv.dm);
   g_lv.dm.detail_open = true;
   if (g_lv.dm.overlay) {
     lv_obj_clear_flag(g_lv.dm.overlay, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(g_lv.dm.overlay);
   }
+  refreshChatDetail(g_lv.dm);   // AFTER un-hiding so bubbles measure correctly and the open-scroll reaches the newest message
 #if defined(HAS_TDECK_KEYBOARD)
   // Physical keyboard: focus the composer on open so typing goes straight in.
   showKb(&g_lv.dm);
@@ -31365,6 +32360,9 @@ void UITask::updateGpsLocation(unsigned long now) {
 
 bool UITask::setRadioParams(float freq_mhz, float bw_khz, uint8_t sf, uint8_t cr, int8_t tx_dbm, float airtime_factor) {
   if (!_node_prefs) return false;
+  // Clamp TX to the radio's range here — the same bound the boot-time load applies — so a too-high
+  // value is corrected the moment it's set + saved, not silently dropped on the next reboot.
+  tx_dbm = constrain(tx_dbm, (int8_t)-9, (int8_t)MAX_LORA_TX_POWER);
   _node_prefs->freq = freq_mhz;
   _node_prefs->bw = bw_khz;
   _node_prefs->sf = sf;
@@ -31439,6 +32437,12 @@ static inline void touchScreenBacklight(bool on) {
   #else
     digitalWrite(TFT_BL, on ? HIGH : LOW);
   #endif
+#elif defined(HAS_TANMATSU)
+  // Tanmatsu: the screen backlight is the CH32-driven display backlight (not LEDC / TFT_BL). Off = a
+  // true 0 duty; on = restore the saved brightness. Without this, idle-off + sleep set _screen_off
+  // but the panel never actually went dark (this branch used to be the (void)on no-op).
+  if (on) applyBrightness(s_brightness_pct);
+  else    bsp_display_set_backlight_brightness(0);
 #else
   (void)on;
 #endif
@@ -31482,6 +32486,18 @@ void UITask::wakeScreen() {
 void UITask::lockScreen() {
   // Backlight off + manual lock so touch is ignored (noteUserInput()
   // early-returns) until a deliberate unlock.
+#if defined(HAS_TANMATSU)
+  // Tanmatsu: a Vol- LONG-press locks. Light the screen + build/show the lock-screen overlay (so the
+  // wallpaper + clock are visible the moment you lock) and block app input (_manual_lock). Another
+  // long Vol- press unlocks; the idle timeout still dims the backlight while locked.
+  _manual_lock = true;
+  _screen_off  = false;
+  setCpuForScreen(true);
+  touchScreenBacklight(true);
+  lockscreenShow();
+  _last_input_ms = millis();
+  return;
+#endif
   touchScreenBacklight(false);
   setCpuForScreen(false);    // screen dark -> drop to 80 MHz
   _screen_off  = true;
@@ -31507,10 +32523,25 @@ void UITask::unlockScreen() {
   _screen_off  = false;
   setCpuForScreen(true);
   touchScreenBacklight(true);
-#if defined(HAS_TDECK_GT911)
+#if defined(HAS_TDECK_GT911) || defined(HAS_TANMATSU)
   lockscreenHide();
 #endif
   _last_input_ms = millis();
+}
+
+// Tanmatsu Vol- LONG-press handler: toggle the hard (overlay) screen lock.
+void UITask::toggleScreenLock() {
+  if (_manual_lock) unlockScreen();
+  else              lockScreen();
+}
+
+// Tanmatsu Vol- SHORT-click / idle-dim: soft screen sleep — backlight off, NOT hard-locked, so any
+// key (or another Vol- click) wakes it. Like the V4 user button, minus the touch-block (no touch here).
+void UITask::sleepScreen() {
+  if (_screen_off) return;
+  touchScreenBacklight(false);
+  setCpuForScreen(false);   // screen dark -> drop to 80 MHz
+  _screen_off = true;
 }
 
 uint16_t UITask::getScreenTimeoutSecs() const {
@@ -31599,10 +32630,10 @@ void UITask::newMsgImpl(uint8_t path_len, const char* from_name, const char* tex
   if (channel && touchPrefsIsNameIgnored(sender)) return;
 #endif
 
-#if defined(HAS_UI_SOUND)
-  // Notification chime (T-Deck I2S speaker / Heltec V4 piezo). @-mentions get a
-  // distinct sound + their own enable, so an operator can mute message sounds but
-  // still hear @-mentions. Each respects the per-channel mute flags.
+#if defined(HAS_UI_SOUND) || defined(HAS_TANMATSU)
+  // Notification chime (T-Deck I2S speaker / Heltec V4 piezo / Tanmatsu I2S codec).
+  // @-mentions get a distinct sound + their own enable, so an operator can mute message
+  // sounds but still hear @-mentions. Each respects the per-channel mute flags.
   {
     const bool is_mention = channel && text && textMentionsMe(text);
     const uint8_t cmute = channel ? touchPrefsGetChannelMute(thread) : 0;
@@ -31749,6 +32780,16 @@ void UITask::appSentMsgToContact(const uint8_t* to_pub, const char* to_name, con
   syncThreadMeshSlots(to_name, false);
 }
 
+void UITask::appSentMsgToChannel(const char* channel_name, const char* text) {
+  if (!channel_name || !channel_name[0] || !text || !text[0]) return;
+  const char* sender = (_node_prefs && _node_prefs->node_name[0]) ? _node_prefs->node_name : "me";
+  // Mirror an app-originated channel message as a local outgoing bubble in the channel thread — the
+  // channel-send command otherwise never tells the on-device UI about companion sends (the DM path
+  // does, via appSentMsgToContact above). appendMessage creates the thread + refreshes the view.
+  appendMessage(channel_name, sender, text, true /*channel*/, true /*outgoing*/, false /*mark_unread*/,
+                0 /*ack_hash*/, DELIV_SENT);
+}
+
 void UITask::newMsg(uint8_t path_len, const char* from_name, const char* text, int msgcount) {
   newMsgImpl(path_len, from_name, text, msgcount, 0 /*meta_flags*/, 0 /*snr*/, 0 /*rssi*/);
 }
@@ -31764,6 +32805,11 @@ void UITask::notify(UIEventType t) {
     case UIEventType::ack:               showAlert(TR("Delivered"), 900); return;
     default: return;
   }
+#if defined(HAS_TANMATSU)
+  // Pulse the envelope-icon LED for an actual incoming message (contact discovery is too spammy).
+  if (t == UIEventType::contactMessage || t == UIEventType::channelMessage || t == UIEventType::roomMessage)
+    msgLedFlash();
+#endif
   // Background traffic (also reflected in the tab badges): show a subtle, low-key
   // chip rather than the prominent centre alert toast, so it's less intrusive.
   // New-contact discovery can be spammy in a busy mesh, so its chip is opt-out in
@@ -31786,6 +32832,9 @@ void UITask::notify(UIEventType t) {
 void UITask::loop() {
   unsigned long now = millis();
   flushHistoryIfDue(now);
+#if defined(HAS_TANMATSU)
+  if (s_msgled_flash_until) msgLedRefresh(getUnreadTotal() > 0);   // end the one-shot envelope-LED flash on time
+#endif
   { static bool s_disc_loaded = false; if (!s_disc_loaded) { s_disc_loaded = true; loadDiscovered(); } }
   discoveredFlushIfDue(now);   // persist the discovered ring (rate-capped) so it survives reboot
   updateGpsLocation(now);   // sync + persist node location from GPS once fixed
@@ -31923,10 +32972,12 @@ void UITask::loop() {
   // every click. Signed keeps a slightly-ahead stamp negative (= "just had input").
   if (_screen_timeout_ms > 0 && !_screen_off &&
       (int32_t)(now - _last_input_ms) >= (int32_t)_screen_timeout_ms) {
-    if (s_lock_on_screen_off) {
+    if (s_lock_on_screen_off && !_manual_lock) {
       // "Lock when screen off": idle dim also hard-locks, so the touchscreen is
       // inert until a deliberate unlock (trackball hold on the T-Deck, BOOT
-      // press on the V4) — Tim's request to stop pocket-taps while dark.
+      // press on the V4) — Tim's request to stop pocket-taps while dark. The
+      // !_manual_lock guard stops the Tanmatsu's lit lock screen from re-firing
+      // lockScreen() (and re-lighting) on every idle tick.
       lockScreen();
     } else {
       touchScreenBacklight(false);
@@ -32060,6 +33111,9 @@ void UITask::loop() {
         lv_obj_add_flag(s_chat_unread_badge, LV_OBJ_FLAG_HIDDEN);
       }
     }
+#if defined(HAS_TANMATSU)
+    msgLedRefresh(getUnreadTotal() > 0);   // envelope LED: breathe green when unread, dark when caught up
+#endif
     // Discovered-count badge on the Contacts-tab "Discovered" button.
     if (s_ct_disc_badge) {
       const int dc = discoveredCount();
@@ -32103,6 +33157,12 @@ void UITask::loop() {
   tdeckKeyboardSetBacklight(kb_bl);
   serviceLockscreen();            // refresh the lock-screen clock on minute roll-over
   serviceLockingCountdown(now);   // advance / fire the spacebar "Locking…" countdown
+#endif
+#if defined(HAS_TANMATSU)
+  // Drive the keyboard backlight from off/on/auto + the Keys-slider brightness; keep it
+  // dark whenever the screen is off/locked. The tick caches, so this per-frame call only
+  // hits the CH32 over I2C when the value actually changes.
+  tanKbBacklightTick(_screen_off || _manual_lock);
 #endif
   refreshLiveDiag(now);
   // Keep the signal fresh with a "discover" probe: send a FLOOD advert whenever

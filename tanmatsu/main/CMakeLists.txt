@@ -44,6 +44,9 @@ set(WADA_DEFS
   MAX_CONTACTS=500 MAX_GROUP_CHANNELS=40   # 2000 was a ~400KB internal-DRAM strand; BT's SDIO RX buffers (MALLOC_CAP_INTERNAL|DMA) need that headroom
   ENABLE_PRIVATE_KEY_IMPORT=1 ENABLE_PRIVATE_KEY_EXPORT=1
   DISPLAY_CLASS=TanmatsuDisplay
+  # microSD lives on the P4's SDMMC *slot 0* (IOMUX pins CLK43/CMD44/D0-3 39-42); slot 1 is the
+  # C6 radio (esp-hosted SDIO), so these make Arduino SD_MMC target slot 0 only — no radio conflict.
+  BOARD_HAS_SDMMC=1 BOARD_SDMMC_SLOT=0
   # the core's ESP32Board.h reads these raw pins directly; Tanmatsu uses badge-bsp, so -1 (none):
   P_LORA_DIO_1=-1 P_LORA_TX_LED=-1 P_LORA_TX_NEOPIXEL_LED=-1
   PIN_BOARD_SCL=-1 PIN_BOARD_SDA=-1 PIN_VBAT_READ=-1)

@@ -21,6 +21,12 @@ CONFIG_ESP_HOSTED_ENABLE_BT_NIMBLE=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_ENABLED=y
 
+# Persist BLE bonds (LTK/IRK) to NVS so a paired phone survives a device reboot. Default is OFF, which
+# keeps bonds in RAM only — after every power-cycle the device has no key, so the phone's saved pairing
+# is rejected as "invalid" and the user must delete + re-pair. The nvs partition (partition_tables/16M.csv)
+# already backs Wi-Fi creds, so there's room for the (max 3) bonds.
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+
 # AsyncTCP (pulled by the core's ESP32Board HTTP-OTA) references CONFIG_ESP_TASK_WDT_TIMEOUT_S,
 # which IDF 5.5 only defines when the task watchdog is initialised. Enable it (5 s timeout).
 CONFIG_ESP_TASK_WDT_INIT=y

@@ -1271,6 +1271,11 @@ void touchPrefsSetEdgeScroll(bool on)      { if (!s_begun) touchPrefsBegin(); pr
 bool touchPrefsGetLockOnScreenOff() { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("lock_off", 0) != 0; }
 void touchPrefsSetLockOnScreenOff(bool on) { if (!s_begun) touchPrefsBegin(); prefsPutUChar("lock_off", on ? 1 : 0); }
 
+#if defined(HAS_TANMATSU)   // only the Tanmatsu has the message LED — keep S3 (T-Deck/V4) bins unchanged
+bool touchPrefsGetMsgLed() { if (!s_begun) touchPrefsBegin(); return s_prefs.getUChar("msg_led", 1) != 0; }   // default ON
+void touchPrefsSetMsgLed(bool on) { if (!s_begun) touchPrefsBegin(); prefsPutUChar("msg_led", on ? 1 : 0); }
+#endif
+
 // Generic blob (used to persist the discovered-nodes list across reboots).
 size_t touchPrefsGetBlob(const char* key, uint8_t* out, size_t maxlen) {
   if (!s_begun) touchPrefsBegin();
@@ -1295,6 +1300,12 @@ uint8_t touchPrefsGetSoundVolume() {
   return v > 100 ? 100 : v;
 }
 void touchPrefsSetSoundVolume(uint8_t vol) { if (vol > 100) vol = 100; if (!s_begun) touchPrefsBegin(); prefsPutUChar("snd_vol", vol); }
+uint8_t touchPrefsGetKbdBacklight() {
+  if (!s_begun) touchPrefsBegin();
+  uint8_t v = s_prefs.getUChar("kbd_bl", 100);
+  return v > 100 ? 100 : v;
+}
+void touchPrefsSetKbdBacklight(uint8_t pct) { if (pct > 100) pct = 100; if (!s_begun) touchPrefsBegin(); prefsPutUChar("kbd_bl", pct); }
 
 // Per-channel mute (name-keyed NVS blob "chm" + tiny RAM cache) --------------
 static const char* KEY_CHM = "chm";

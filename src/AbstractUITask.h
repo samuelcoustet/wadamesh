@@ -94,6 +94,12 @@ public:
                                    uint32_t ack_hash) {
     (void)to_pub; (void)to_name; (void)text; (void)ack_hash;
   }
+  /** Mirror an app-originated CHANNEL message into the on-device UI — the channel-send path, like the
+   *  DM path above, never shows companion-originated sends on screen otherwise. text is NUL-terminated
+   *  by the caller. Default no-op for non-touch UIs. */
+  virtual void appSentMsgToChannel(const char* channel_name, const char* text) {
+    (void)channel_name; (void)text;
+  }
   virtual void notify(UIEventType t = UIEventType::none) = 0;
   virtual void appendDiag(const char* message) { (void)message; }
   /** Notify UI of an advert reception. `is_new=true` means the contact is NOT in

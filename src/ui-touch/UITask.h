@@ -410,6 +410,9 @@ public:
   void unlockScreen();
   /** True while the panel backlight is off (idle-dimmed or manually locked). */
   bool isScreenOff() const { return _screen_off; }
+  bool isManualLocked() const { return _manual_lock; }   // hard screen lock engaged
+  void toggleScreenLock();                                // Tanmatsu Vol- long-press: lock <-> unlock
+  void sleepScreen();                                     // soft screen sleep (backlight off, not locked)
   /** True while hard-locked (manual lock engaged), whether lit or dark. */
   bool isManualLock() const { return _manual_lock; }
   bool sendAdvertNow();         // legacy: zero-hop
@@ -440,6 +443,7 @@ public:
                                  int8_t snr_q4, int8_t rssi) override;
   void appSentMsgToContact(const uint8_t* to_pub, const char* to_name, const char* text,
                            uint32_t ack_hash) override;
+  void appSentMsgToChannel(const char* channel_name, const char* text) override;
   void notify(UIEventType t = UIEventType::none) override;
   void logRxFrame(float snr, float rssi, const uint8_t* raw, int len) override;
   void discoveredContact(const ContactInfo& contact, bool is_new, uint8_t path_len) override;

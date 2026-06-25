@@ -264,6 +264,11 @@ bool    touchPrefsGetSoundMentions();          // default true
 void    touchPrefsSetSoundMentions(bool on);
 uint8_t touchPrefsGetSoundVolume();            // 0..100, default 70
 void    touchPrefsSetSoundVolume(uint8_t vol);
+
+/** Tanmatsu keyboard backlight brightness, 0–100 %. Default 100. Separate from
+ *  screen brightness (touchPrefsGet/SetBrightness) and volume (…SoundVolume). */
+uint8_t touchPrefsGetKbdBacklight();
+void    touchPrefsSetKbdBacklight(uint8_t pct);
 bool    touchPrefsGetEnterSends();             // Enter key sends a chat message (default true)
 void    touchPrefsSetEnterSends(bool on);
 bool    touchPrefsGetClock12h();               // 12-hour clock (default false = 24h)
@@ -345,6 +350,13 @@ bool     touchPrefsSetLockTextColor(uint32_t rgb);
  *  default. */
 bool touchPrefsGetColorfulBubbles();
 bool touchPrefsSetColorfulBubbles(bool on);
+
+/** Tanmatsu message-notification LED: flash the envelope-icon LED on a new message and breathe it
+ *  softly while there are unread messages. Default ON. Tanmatsu-only (no such LED on T-Deck/V4). */
+#if defined(HAS_TANMATSU)
+bool touchPrefsGetMsgLed();
+void touchPrefsSetMsgLed(bool on);
+#endif
 
 /** UI accent colour (buttons, active tab, keyboard, highlights) as 0xRRGGBB.
  *  Default = the stock neutral gray; the picker keeps it dark enough that the

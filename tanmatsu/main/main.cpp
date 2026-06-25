@@ -27,6 +27,8 @@ extern "C" {
 #include "bsp/device.h"
 #include "bsp/input.h"
 #include "bsp/display.h"
+#include "bsp/tanmatsu.h"             // bsp_tanmatsu_coprocessor_get_handle (C6 radio power)
+#include "tanmatsu_coprocessor.h"     // tanmatsu_coprocessor_radio_disable / _enable_application
 #include "esp_hosted.h"       // C6 radio co-processor link (WiFi + LoRa ride esp-hosted)
 #include "esp_netif.h"        // lwIP/tcpip bring-up (else WiFi calls assert "Invalid mbox")
 #include "esp_event.h"
@@ -304,6 +306,19 @@ static void wadameshSetup() {
   esp_netif_init();
   esp_event_loop_create_default();
   bootLog("C6 radio coproc");
+  // Power-cycle the C6 through the CH32 so the app ALWAYS gets a fresh C6. Without this,
+  // re-launching the app (especially right after a flash) onto a C6 still in its previous
+  // state wedges esp-hosted ("Not able to connect with ESP-Hosted slave") into a P4 reboot
+  // loop that previously only a manual power cycle cleared — this does the same in software.
+  {
+    tanmatsu_coprocessor_handle_t cph = nullptr;
+    if (bsp_tanmatsu_coprocessor_get_handle(&cph) == ESP_OK && cph) {
+      tanmatsu_coprocessor_radio_disable(cph);
+      delay(150);
+      tanmatsu_coprocessor_radio_enable_application(cph);   // boot the C6 into its esp-hosted slave fw
+      delay(600);                                           // let the C6 come up before we attach
+    }
+  }
   hostedConnectC6();          // identify the C6 slave so WiFi + LoRa work (must precede radio_init)
   bootLog("Radio link");
   if (!radio_init()) { bootLog("radio init FAILED"); Serial.println("[BOOT] radio_init FAILED"); }
@@ -437,6 +452,11 @@ extern "C" void app_main(void) {
       }
       if (WiFi.status() == WL_CONNECTED) {
         if (!modem_sleep_set) { WiFi.setSleep(true); modem_sleep_set = true; }
+        // Start the TCP (+ WebSocket) companion server now the STA is associated. Deferred to here on
+        // purpose: starting WiFiServer before association asserts in lwIP (the old reason this was
+        // stubbed out). startTcpServer() is idempotent — it no-ops once the server is up — so calling
+        // it on every connected tick is safe.
+        serial_interface.startTcpServer(true);
         if (!sntp_kicked) {
           char tz[48]; touchPrefsBuildLocalTz(tz, sizeof tz);
           configTzTime(tz, "pool.ntp.org", "time.google.com");
@@ -447,8 +467,7 @@ extern "C" void app_main(void) {
         }
       } else if (sntp_kicked && !sntp_pushed) { sntp_kicked = false; }
     }
-    // (No TCP/WS companion server on the Tanmatsu — the companion app connects over USB serial.
-    // Starting WiFiServer here asserted in lwIP when the STA wasn't associated yet.)
+    serial_interface.tickWebSocketHandshake();   // accept WS clients/handshakes (no-op until the WS server is up)
 
     the_mesh.loop();     // mesh + companion servers
     vTaskDelay(1);

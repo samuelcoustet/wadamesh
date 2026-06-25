@@ -2880,6 +2880,12 @@ void MyMesh::handleCmdFrame(size_t len) {
       bool success = getChannel(channel_idx, channel);
       if (success && sendGroupMessage(msg_timestamp, channel.channel, _prefs.node_name, text, len - i)) {
         writeOKFrame();
+#if defined(HAS_TANMATSU)
+        // Mirror the app-sent channel message into the on-device touch UI — the channel-send path
+        // otherwise never shows companion-originated channel sends on screen (the DM path does, via
+        // appSentMsgToContact). NUL-terminate the text in-place first, exactly as the DM path does.
+        if (_ui) { cmd_frame[len] = 0; _ui->appSentMsgToChannel(channel.name, text); }
+#endif
         // Sent channel messages are not added to shared history / broadcast: channel_idx and
         // frame format are device-specific and clients (e.g. HA) without channel support can
         // misparse or show "text as sender"; also avoids failed-to-sync when versions differ.
