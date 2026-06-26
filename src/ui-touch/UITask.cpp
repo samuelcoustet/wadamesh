@@ -21332,6 +21332,14 @@ static void crashReportConfirmCb() {
 }
 static void crashReportMaybePrompt() {
   if (s_crash_dump_size == 0) return;
+  // Only prompt on the boot that ACTUALLY followed a crash. The coredump persists in its flash
+  // partition across resets, so prompting whenever a dump merely exists re-showed "restarted after a
+  // crash" on every manual reset / power-cycle until it was exported. Gate on this boot's reset reason;
+  // the dump is still listed + exportable from Settings -> About (and via esptool) regardless.
+  {
+    esp_reset_reason_t rr = esp_reset_reason();
+    if (rr != ESP_RST_PANIC && rr != ESP_RST_TASK_WDT && rr != ESP_RST_INT_WDT && rr != ESP_RST_WDT) return;
+  }
   static char m[280];
   snprintf(m, sizeof m,
            LV_SYMBOL_WARNING "  The device restarted after a crash.\n\n%s%s"
