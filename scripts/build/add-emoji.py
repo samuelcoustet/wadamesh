@@ -38,6 +38,18 @@ SEQ = [
 ]
 
 
+# Country/region flags: a regional-indicator PAIR (e.g. LS = U+1F1F1 U+1F1F8) baked
+# as ONE image keyed on the LEAD indicator, the trailing indicator mapped to the
+# zero-width glyph (same trick as SEQ). Noto's png/128 ships no flags, so pull the
+# flat rectangle from the same Noto project's third_party/region-flags. No bare
+# regional indicator is ever offered in the UI, so reusing the lead cp as the key
+# is safe — and the picker currently has no other flag using these indicators.
+FLAGS = [
+    # (lead_cp, trail_cp, ISO-3166-alpha-2)
+    (0x1F1F1, 0x1F1F8, "LS"),   # Lesotho
+]
+
+
 def fetch(stem):
     fn = os.path.join(CACHE, "u_{}.png".format(stem))
     if os.path.exists(fn) and os.path.getsize(fn) > 0:
@@ -52,6 +64,22 @@ def fetch(stem):
         except Exception:
             continue
     return None
+
+
+def fetch_flag(iso):
+    fn = os.path.join(CACHE, "flag_{}.png".format(iso))
+    if os.path.exists(fn) and os.path.getsize(fn) > 0:
+        return fn
+    url = ("https://raw.githubusercontent.com/googlefonts/noto-emoji/main"
+           "/third_party/region-flags/png/{}.png".format(iso))
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "emoji-gen"})
+        data = urllib.request.urlopen(req, timeout=20).read()
+        with open(fn, "wb") as f:
+            f.write(data)
+        return fn
+    except Exception:
+        return None
 
 
 def to_rgb565a8(img):
@@ -94,12 +122,29 @@ for key_cp, stem, zeros in SEQ:
     for z in zeros:
         new_entries.append((z, "d_zero"))
 
+for lead_cp, trail_cp, iso in FLAGS:
+    fn = fetch_flag(iso)
+    if not fn:
+        sys.exit("FAILED to fetch flag {} for U+{:X}".format(iso, lead_cp))
+    new_defs.append((lead_cp, "e_{:x}".format(lead_cp), to_rgb565a8(Image.open(fn))))
+    new_entries.append((lead_cp, "d_{:x}".format(lead_cp)))
+    new_entries.append((trail_cp, "d_zero"))
+
 # ---- splice into emoji_data.c ----
 src = open(OUTC).read()
 TYPE_MARK = "\ntypedef struct { uint32_t cp;"
 FUNC_MARK = "const lv_img_dsc_t* emojiGlyphLookup(uint32_t cp) {"
 head = src[:src.index(TYPE_MARK)]                 # header + includes + all glyph defs
 func = src[src.index(FUNC_MARK):]                 # the binary-search getter (verbatim)
+
+# Idempotency: on a RE-RUN, `head` still holds the e_/d_ glyph defs spliced in by a
+# PRIOR run (they live before the typedef), so blindly re-appending new_defs would
+# redefine them ("redefinition of e_26bd"). Strip any def for a cp we're about to
+# re-bake; the lookup table dedups separately (bycp), so this only touches defs.
+for _cp, _ename, _data in new_defs:
+    _hx = "{:x}".format(_cp)
+    head = re.sub(r"static const uint8_t e_" + _hx + r"\[\] = [^;]*;\n", "", head)
+    head = re.sub(r"static const lv_img_dsc_t d_" + _hx + r" = [^;]*;\n", "", head)
 
 # Existing lookup entries (includes the FE0F/FE0E/200D -> d_zero rows).
 existing = [(int(cp, 16), ref) for cp, ref in

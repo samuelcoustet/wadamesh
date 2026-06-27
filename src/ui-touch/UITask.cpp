@@ -4137,6 +4137,25 @@ static void hideKb() {
   }
 }
 
+// Tear down a SCROLLABLE overlay/sheet (emoji grid, quick-reply list, Wi-Fi scan,
+// pickers, …) without the lvgl sync-del-scroll use-after-free. If the overlay is
+// the active scroll object when it's freed, LVGL's indev_proc_release still runs
+// _lv_indev_scroll_throw_handler on the (now-freed) object → LoadProhibited crash
+// — confirmed from a field beta_18 coredump (get_prop_core on a freed PSRAM obj at
+// EXCVADDR 0x18). Guard it exactly like closeSettingsCategory:
+//   • lv_indev_wait_release  → the next indev cycle short-circuits before the throw
+//     handler, so scroll momentum can't re-fire on the gone object;
+//   • lv_obj_del_async       → the object survives the CURRENT indev cycle (whose
+//     local scroll_obj was already captured) and is freed only after the tick.
+// Pass the static root by address so it's nulled here in one place.
+static void closeScrollOverlay(lv_obj_t** root) {
+  if (!root || !*root) return;
+  lv_indev_t* act = lv_indev_get_act();
+  if (act) lv_indev_wait_release(act);
+  lv_obj_del_async(*root);
+  *root = nullptr;
+}
+
 static void showKb(LvChatPanel* p) {
   if (!g_lv.keyboard || !p || !p->composer_ta || !p->msgs || !p->composer_row) return;
   kbMirrorSyncToReal();
@@ -4747,10 +4766,7 @@ static lv_obj_t* s_channel_long_sheet = nullptr;
 static int       s_channel_long_idx = -1;
 
 static void closeChannelLongSheet() {
-  if (s_channel_long_sheet) {
-    lv_obj_del(s_channel_long_sheet);
-    s_channel_long_sheet = nullptr;
-  }
+  closeScrollOverlay(&s_channel_long_sheet);
 }
 
 static void channelLongSheetDismissCb(lv_event_t* e) {
@@ -5106,9 +5122,10 @@ static const char* const k_emoji_items[] = {
   // animals
   "\xF0\x9F\x90\xB6","\xF0\x9F\x90\xB1","\xF0\x9F\x90\xB8","\xF0\x9F\x90\xBB",
   "\xF0\x9F\x90\xA7","\xF0\x9F\x90\x9D",
-  // activity / flags  (soccer, football, moai, transgender flag)
+  // activity / flags  (soccer, football, moai, transgender flag, Lesotho flag)
   "\xE2\x9A\xBD","\xF0\x9F\x8F\x88","\xF0\x9F\x97\xBF",
   "\xF0\x9F\x8F\xB3\xEF\xB8\x8F\xE2\x80\x8D\xE2\x9A\xA7\xEF\xB8\x8F",
+  "\xF0\x9F\x87\xB1\xF0\x9F\x87\xB8",
   // special characters / punctuation / currency / math
   "\xE2\x80\x94","\xE2\x80\xA6","\xE2\x80\x9C","\xE2\x80\x9D","\xE2\x80\x98",
   "\xE2\x80\x99","\xE2\x86\x92","\xE2\x86\x90","\xC2\xB0","\xC2\xB1",
@@ -5141,7 +5158,7 @@ static const char* const* s_glyph_items = k_emoji_items;
 static int                 s_glyph_count = k_emoji_count;
 
 static void closeEmojiSheet() {
-  if (s_emoji_sheet) { lv_obj_del(s_emoji_sheet); s_emoji_sheet = nullptr; }
+  closeScrollOverlay(&s_emoji_sheet);
   s_emoji_target_ta = nullptr;
   s_emoji_grid = nullptr;
   s_emoji_sel = -1;
@@ -5358,10 +5375,7 @@ static void openEmojiPickerForComposer(lv_obj_t* ta) { if (ta) openEmojiPicker(t
 #endif
 
 static void closeQuickReplySheet() {
-  if (s_qr_sheet) {
-    lv_obj_del(s_qr_sheet);
-    s_qr_sheet = nullptr;
-  }
+  closeScrollOverlay(&s_qr_sheet);
   s_qr_panel = nullptr;
 }
 
@@ -7236,6 +7250,24 @@ static void buildRadioSettings() {
     return ta;
   };
 
+  // Section divider + small header — groups this flat list into RADIO / MESH / SIGNAL.
+  auto mk_section = [&](const char* title) {
+    y += SC(6);
+    lv_obj_t* sep = lv_obj_create(body);
+    lv_obj_remove_style_all(sep);
+    lv_obj_set_size(sep, s_settings_content_w, 1);
+    lv_obj_set_pos(sep, 0, y);
+    lv_obj_set_style_bg_color(sep, lv_color_hex(0x303438), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_t* sl = lv_label_create(body);
+    lv_label_set_text(sl, TR(title));
+    lv_obj_set_style_text_color(sl, lv_color_hex(0x8A929B), LV_PART_MAIN);
+    lv_obj_set_style_text_font(sl, &g_font_12, LV_PART_MAIN);
+    lv_obj_set_pos(sl, 2, y + SC(7));
+    y += SC(28);
+  };
+
+  mk_section("RADIO");
   mk_label("Community preset (meshcomod web)");
   {
     static char preset_opt_buf[1200];
@@ -7312,29 +7344,32 @@ static void buildRadioSettings() {
     const uint32_t toa = prefs ? loraToaMs(prefs->sf, prefs->bw, prefs->cr, 40) : 0;
     lv_obj_t* rl = lv_label_create(body);
     char rb[80];
-    snprintf(rb, sizeof rb, "\xE2\x89\x88 %d%% max duty cycle  \xC2\xB7  ~%lu ms / 40-byte packet",
+    // No "≈" (U+2248) — not in the UI font, renders as tofu. "·" (U+00B7) is fine.
+    snprintf(rb, sizeof rb, "~%d%% max duty cycle  \xC2\xB7  ~%lu ms / 40B packet",
              duty, (unsigned long)toa);
     lv_label_set_text(rl, rb);
+    lv_obj_set_width(rl, s_settings_content_w - SC(4));
     lv_obj_set_style_text_font(rl, &g_font_12, LV_PART_MAIN);
     lv_obj_set_style_text_color(rl, lv_color_hex(COLOR_ACCENT), LV_PART_MAIN);
     lv_obj_set_pos(rl, 2, y);
     y += SC(22);
   }
 
+  mk_section("MESH");
+
   // Answer telemetry requests — surfaces MeshCore's telemetry_mode_* gate (battery +
   // environment; location telemetry keeps its own separate setting so a simple
   // "allow" can't leak position). Off = ignore other nodes' requests for our telemetry.
   {
-    lv_obj_t* l = lv_label_create(body);
-    lv_label_set_text(l, TR("Answer telemetry requests"));
-    lv_obj_set_style_text_font(l, &g_font_14, LV_PART_MAIN);
-    lv_obj_set_style_text_color(l, lv_color_hex(COLOR_TEXT), LV_PART_MAIN);
-    lv_obj_set_pos(l, 2, y + SC(4));
+    // settingsRowLabel reserves the right 56 px for the switch; lv_obj_align
+    // TOP_RIGHT then sits it flush to the body edge (the cw - SC(48) absolute pos
+    // ran off-screen under the scrollbar).
+    int h = settingsRowLabel(body, y, 4, "Answer telemetry requests", COLOR_TEXT, nullptr, 56);
     lv_obj_t* sw = lv_switch_create(body);
-    lv_obj_set_pos(sw, cw - SC(48), y);
+    lv_obj_align(sw, LV_ALIGN_TOP_RIGHT, 0, y);
     if (prefs && prefs->telemetry_mode_base != 0) lv_obj_add_state(sw, LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, telemetryAllowChangedCb, LV_EVENT_VALUE_CHANGED, nullptr);
-    y += SC(40);
+    y += LV_MAX(SC(40), h + SC(12));
   }
 
   // Multi-byte routing: how many bytes of each repeater's hash this node stamps
@@ -7375,6 +7410,8 @@ static void buildRadioSettings() {
       lv_textarea_set_text(g_set_modal.region_ta, rbuf);
   }
   y += SC(38);
+
+  mk_section("SIGNAL");
 
   // Signal probe — same setting as the home-graph Signal popup. A periodic
   // discover advert keeps the signal bars / graph fresh. Poll interval in whole
@@ -9879,7 +9916,7 @@ static void saveWifiCb(lv_event_t* e) {
 #endif
 
 static void wifiScanPopupClose() {
-  if (s_wifi_scan_popup) { lv_obj_del(s_wifi_scan_popup); s_wifi_scan_popup = nullptr; }
+  closeScrollOverlay(&s_wifi_scan_popup);
   s_wifi_scan_list = nullptr;
 }
 static void wifiScanPopupCloseCb(lv_event_t* e) {
@@ -12083,10 +12120,7 @@ static void contactSelectCb(lv_event_t* e) {
 // ============================================================
 
 static void closeAddChannelSheet() {
-  if (s_addch_sheet) {
-    lv_obj_del(s_addch_sheet);
-    s_addch_sheet = nullptr;
-  }
+  closeScrollOverlay(&s_addch_sheet);
 }
 
 // Convert 32 hex chars in `hex` to 16 raw bytes. Returns false if input is
@@ -24225,7 +24259,7 @@ static char s_lockwall_paths[24][TOUCH_LOCK_WALLPAPER_MAXLEN];
 static int  s_lockwall_count = 0;
 
 static void lockwallPickerClose() {
-  if (s_lockwall_picker) { lv_obj_del(s_lockwall_picker); s_lockwall_picker = nullptr; }
+  closeScrollOverlay(&s_lockwall_picker);
 }
 static void lockwallPickerCloseCb(lv_event_t* e) {
   if (lv_event_get_code(e) == LV_EVENT_CLICKED) lockwallPickerClose();
@@ -24500,7 +24534,7 @@ static void backupScan() {
 #endif
 }
 static void backupPickerClose() {
-  if (s_backup_picker) { lv_obj_del(s_backup_picker); s_backup_picker = nullptr; }
+  closeScrollOverlay(&s_backup_picker);
 }
 static void backupPickerCloseCb(lv_event_t* e) {
   if (lv_event_get_code(e) == LV_EVENT_CLICKED) backupPickerClose();
@@ -25117,6 +25151,13 @@ static void handleHwKey(int key) {
       lv_textarea_add_char(ta, ' ');
     }
   } else if (key == 0x0D) {                   // regular ENTER (CR)
+    // Enter is a non-typing action (send / newline / submit) — always tear down the
+    // accent + @-mention popups. The Enter-to-send path keeps the keyboard up "for the
+    // next message", so without this the accent box for the last letter lingers over
+    // the now-cleared composer (the reported bug). The on-screen Send button already
+    // goes through hideKb(); this covers the physical-keyboard Enter.
+    accentBoxHide();
+    mentionBoxHide();
 #if defined(HAS_TDECK_GT911)
     if (s_editor_ta && ta == s_editor_ta) {
       lv_textarea_add_char(ta, '\n');   // multiline editor: Enter inserts a newline
@@ -26239,7 +26280,7 @@ enum AppDrawerAction {
 };
 
 static void closeAppDrawer() {
-  if (s_appdrawer_root) { lv_obj_del_async(s_appdrawer_root); s_appdrawer_root = nullptr; }
+  closeScrollOverlay(&s_appdrawer_root);   // del_async + wait_release: the drawer grid scrolls, so guard the throw UAF
 }
 
 // Synchronous close — removes the overlay THIS instant, not deferred. Only safe
@@ -27621,6 +27662,16 @@ static void relayoutHomeCharts() {
   const int chart_w = cw;
 #endif
 
+  // The env summary line is hard-placed at SC(58) in the tree, which collides with
+  // the (up to two-line, WRAP) stats line on the narrow V4 portrait — the stats line
+  // can reach ~SC(72). Flow the env line directly below the MEASURED stats bottom so
+  // they never overlap; everything downstream (env chart, TX/RX chart, advert button)
+  // already reflows off env_bottom + shrinks the chart to fit the tab.
+  if (g_lv.home_stats) {
+    lv_obj_update_layout(g_lv.home_stats);
+    const lv_coord_t stats_bottom = lv_obj_get_y(g_lv.home_stats) + lv_obj_get_height(g_lv.home_stats);
+    lv_obj_align(g_lv.home_env, LV_ALIGN_TOP_LEFT, 0, stats_bottom + SC(4));
+  }
   lv_obj_update_layout(g_lv.home_env);
   const lv_coord_t env_bottom = lv_obj_get_y(g_lv.home_env) + lv_obj_get_height(g_lv.home_env);
   const int env_chart_y = LV_MAX(SC(92), (int)env_bottom + SC(6));
