@@ -128,6 +128,35 @@ local function mklist(x, y, w, h)
   return l
 end
 
+-- ---- wada.map mock ----------------------------------------------------------
+-- Tracks every map:center() call for scenario assertions.
+local map_obj, map_centers = nil, {}
+local function mkmap(mx, my, mw, mh)
+  checkint(mx, "map x"); checkint(my, "map y"); checkint(mw, "map w"); checkint(mh, "map h")
+  assert(mw > 0 and mh > 0, "map: w/h must be positive")
+  if map_obj then error("only one map view at a time (call :close() first)") end
+  local m = { x = mx, y = my, w = mw, h = mh, _zoom = 10, _lat = 0, _lon = 0 }
+  function m:center(lat, lon, z)
+    assert(type(lat) == "number", "map:center lat"); assert(type(lon) == "number", "map:center lon")
+    self._lat = lat; self._lon = lon
+    if z then self._zoom = z end
+    map_centers[#map_centers + 1] = { lat = lat, lon = lon, z = self._zoom }
+  end
+  function m:zoom(z)
+    if z then self._zoom = z else return self._zoom end
+  end
+  function m:marker(lat, lon, col, sz) end
+  function m:line(la1, lo1, la2, lo2, col, w) end
+  function m:clear() end
+  function m:tiles() return cfg.map_tiles or 0 end
+  function m:redraw() end
+  function m:to_screen(lat, lon) return math.floor(mw / 2), math.floor(mh / 2) end
+  function m:to_latlon(x, y) return self._lat + (mh/2 - y)*0.001, self._lon + (x - mw/2)*0.001 end
+  function m:close() map_obj = nil end
+  map_obj = m
+  return m
+end
+
 -- ---- mock SD card: mirrors wada.sd in LuaAppHost.cpp -------------------------
 -- cfg.sdtree is built by mktree(): a dir is { dir = {name -> node}, order = {names} },
 -- a file is { data = "bytes" }. Paging, path rules, error strings and the threat
@@ -268,6 +297,7 @@ local function build_wada()
   end
   wada.ui.chart = function() error("chart not mocked") end
   wada.ui.list = mklist
+  wada.map = { view = mkmap }
   wada.ui.clear = function() labels, buttons, lists = {}, {}, {}; widgets.cleared = (widgets.cleared or 0) + 1 end
   wada.ui.text_lines = function(str, width, sz)
     checkstr(str, "text_lines"); checkint(width, "text_lines width")
@@ -296,7 +326,8 @@ local function build_wada()
                                        audio = cfg.caps.audio or false,
                                        audio_wav = cfg.caps.audio or false,
                                        audio_mp3 = cfg.caps.audio or false,
-                                       audio_sd = cfg.caps.audio_sd or false } end
+                                       audio_sd = cfg.caps.audio_sd or false,
+                                       map = cfg.caps.sdk_ext or false } end
   if cfg.caps.sdk_ext then
     wada.sys.battery = function() return { mv = 3900, pct = 70, charging = false } end
     wada.sys.gps = function() return cfg.gps and cfg.gps() or nil end
@@ -436,6 +467,7 @@ local function reset_world()
   widgets = { canvases = 0, labels = 0, buttons = 0, scroll = false, timer_ms = nil }
   labels, buttons, toasts, drawlog = {}, {}, {}, { text = {}, circles = {}, ops = 0 }
   lists = {}
+  map_obj, map_centers = nil, {}
   clock_ms = 1000
   audio_state = { state = "stopped", path = "", source = "", format = "", error = nil }
   dm_sent = {}
@@ -1861,6 +1893,239 @@ scenarios.protreck_cost = function()
   if app.on_close then guarded(BUDGET, app.on_close) end
 end
 
+-- ---- MapFetch scenarios -----------------------------------------------------
+
+local function mapfetch_open(w, h, gps_lat, gps_lon, map_tiles)
+  cfg = {
+    w = w, h = h,
+    caps = { sdk_ext = true, keyboard = true, touch = true },
+    map_tiles = map_tiles or 0,
+  }
+  if gps_lat then cfg.gps = function() return { lat = gps_lat, lon = gps_lon, lat_e6 = 0, lon_e6 = 0 } end end
+  open(APP_PATH)
+end
+
+scenarios.mapfetch_tdeck = function()
+  mapfetch_open(320, 240, 48.8566, 2.3522)   -- T-Deck, GPS Paris
+  assert(widgets.labels >= 2, "need top+bottom labels")
+  assert(map_obj ~= nil, "map view must be created")
+  -- check the setup label mentions radius and zoom
+  local found = false
+  for _, l in ipairs(labels) do if l.text:find("5km") then found = true end end
+  assert(found, "setup label should show default 5km radius")
+end
+
+scenarios.mapfetch_no_map = function()
+  cfg = { w = 320, h = 240, caps = { sdk_ext = false, keyboard = false, touch = true } }
+  open(APP_PATH)
+  -- no map cap → shows error label, no map_obj
+  assert(map_obj == nil, "no map view on non-ext board")
+  local found = false
+  for _, l in ipairs(labels) do if l.text:find("No map") or l.text:find("not available") then found = true end end
+  assert(found, "should show 'no map support' label when caps.map is false")
+end
+
+scenarios.mapfetch_no_gps = function()
+  mapfetch_open(320, 240, nil, nil)  -- no GPS
+  -- tap to start → should show GPS error, not crash
+  input({ type = "down", x = 160, y = 120 })
+  local found = false
+  for _, l in ipairs(labels) do if l.text:find("GPS") or l.text:find("fix") then found = true end end
+  assert(found, "should warn about missing GPS when starting")
+end
+
+scenarios.mapfetch_swipe = function()
+  mapfetch_open(320, 240, 48.8566, 2.3522)
+  local lbl_before = labels[1] and labels[1].text or ""
+  swipe(nil, "up")   -- increase radius
+  local lbl_after = labels[1] and labels[1].text or ""
+  assert(lbl_before ~= lbl_after, "swipe up should change radius display")
+  swipe(nil, "down") -- decrease radius back
+  swipe(nil, "left") -- increase max zoom
+  swipe(nil, "right")-- decrease max zoom back
+  -- app must still be running normally
+  assert(map_obj ~= nil, "map view still present after swipes")
+end
+
+scenarios.mapfetch_logic = function()
+  -- Run a few ticks and verify tiles are visited in order with a GPS fix
+  mapfetch_open(320, 240, 48.8566, 2.3522, 1)  -- map_tiles=1 (all "cached")
+  input({ type = "down", x = 160, y = 120 })    -- start download
+  local prev = #map_centers
+  for _ = 1, 5 do tick(nil, 1) end              -- advance 5 tiles
+  assert(#map_centers > prev, "map:center should be called as tiles are visited")
+  -- each call must have valid lat/lon
+  for _, c in ipairs(map_centers) do
+    assert(type(c.lat) == "number" and type(c.lon) == "number", "tile center must be numeric")
+    assert(c.z >= 10 and c.z <= 15, "zoom must be in expected range")
+  end
+end
+
+scenarios.mapfetch_done = function()
+  -- Use smallest radius/zoom so the full download finishes in a reasonable loop count
+  mapfetch_open(320, 240, 48.8566, 2.3522, 1)
+  -- set radius_idx=1 (2km) and zm_idx=1 (z12) via swipes
+  swipe(nil, "down")  -- radius down to 2km
+  swipe(nil, "right") -- zoom down to z12
+  input({ type = "down", x = 160, y = 120 })  -- start
+  for _ = 1, 200 do tick(nil, 1) end           -- run until done
+  local done = false
+  for _, l in ipairs(labels) do if l.text:find("Done") then done = true end end
+  assert(done, "app should reach Done state after all tiles visited")
+  assert(not cfg.awake, "keep_awake must be off after done")
+end
+
+scenarios.mapfetch_cost = function()
+  mapfetch_open(320, 240, 48.8566, 2.3522)
+  input({ type = "down", x = 160, y = 120 })
+  local ops0 = drawlog.ops
+  tick(nil, 1)
+  local cost = drawlog.ops - ops0
+  assert(cost < 500, string.format("on_tick draw ops %d >= 500", cost))
+end
+
+-- ---- MapFetch scenarios end --------------------------------------------------
+
+-- ---- Trip Odometer (deploy/apps/tripodometer) --------------------------------
+
+scenarios.trip_v4 = function()
+  -- portrait touch board, no GPS fix → "no fix" shown, all zeros
+  cfg = { w = 240, h = 276, caps = { touch = true, keyboard = false, sdk_ext = true } }
+  cfg.gps = function() return nil end
+  storekv = {}; wada = build_wada()
+  local app = load_app()
+  assert(guarded(BUDGET, app.on_open, cfg.w, cfg.h))
+  assert(widgets.buttons == 2, "expected 2 buttons (Start/Stop + Reset)")
+  tick(app, 5)
+  local dump = label_dump()
+  print("  no fix:", dump)
+  assert(dump:find("no fix") or dump:find("no GPS"), "expected no-fix indicator")
+  assert(dump:find("0:00"), "expected zero elapsed time")
+  if app.on_close then guarded(BUDGET, app.on_close) end
+end
+
+scenarios.trip_tdeck = function()
+  -- T-Deck landscape, GPS fix, start/stop tracking
+  cfg = { w = 320, h = 240, caps = { touch = true, keyboard = false, sdk_ext = true } }
+  cfg.gps = function() return { lat = 37.75, lon = -122.45, sats = 8, alt_m = 42, speed_kmh = 25.0, course = 90.0 } end
+  storekv = {}; wada = build_wada()
+  local app = load_app()
+  assert(guarded(BUDGET, app.on_open, cfg.w, cfg.h))
+  tick(app, 2)
+  local dump = label_dump()
+  print("  fix before start:", dump)
+  assert(dump:find("25.0"), "expected speed 25.0 displayed")
+  -- start tracking
+  buttons[1].fn(); tick(app, 3)
+  dump = label_dump()
+  print("  tracking:", dump)
+  assert(dump:find("tracking"), "expected tracking status after Start")
+  -- stop
+  buttons[1].fn(); tick(app, 1)
+  dump = label_dump()
+  print("  paused:", dump)
+  assert(dump:find("paused"), "expected paused after Stop")
+  if app.on_close then guarded(BUDGET, app.on_close) end
+end
+
+scenarios.trip_moving = function()
+  -- movement: distance accumulates, home bearing appears, min altitude tracked
+  cfg = { w = 240, h = 276, caps = { touch = true, keyboard = false, sdk_ext = true } }
+  local step = 0
+  cfg.gps = function()
+    step = step + 1
+    return { lat = 37.75 + step * 0.001, lon = -122.45,
+             sats = 8, alt_m = 100 - step, speed_kmh = 30.0 + step }
+  end
+  storekv = {}; wada = build_wada()
+  local app = load_app()
+  assert(guarded(BUDGET, app.on_open, cfg.w, cfg.h))
+  buttons[1].fn()   -- start tracking
+  tick(app, 15)     -- 15 fixes moving north ~111 m each → ~1.5 km
+  local dump = label_dump()
+  print("  after 15 ticks:", dump)
+  assert(not dump:find("| 0 m |"), "expected non-zero distance")
+  assert(dump:find("km/h"), "expected avg/max speed km/h displayed")
+  -- home bearing: moving north, home is to the south → "S"
+  assert(dump:find(" S"), "expected southward home bearing")
+  -- min altitude: descending from 99 to 85
+  assert(dump:find("85") or dump:find("min"), "expected min altitude tracked")
+  if app.on_close then guarded(BUDGET, app.on_close) end
+end
+
+scenarios.trip_persist = function()
+  -- on_close saves; on_open restores trip data
+  cfg = { w = 240, h = 276, caps = { touch = true, keyboard = false, sdk_ext = true } }
+  local step = 0
+  cfg.gps = function()
+    step = step + 1
+    return { lat = 37.75 + step * 0.001, lon = -122.45, sats = 7, alt_m = 50, speed_kmh = 15.0 }
+  end
+  storekv = {}; wada = build_wada()
+  local app = load_app()
+  guarded(BUDGET, app.on_open, cfg.w, cfg.h)
+  buttons[1].fn(); tick(app, 10)    -- ~1 km
+  if app.on_close then guarded(BUDGET, app.on_close) end
+  assert(storekv.trip_km_x1000 ~= nil and storekv.trip_km_x1000 > 0, "expected trip_km_x1000 saved")
+  -- re-open same store → distance should be restored
+  wada = build_wada()
+  local app2 = load_app()
+  guarded(BUDGET, app2.on_open, cfg.w, cfg.h)
+  local dump = label_dump()
+  print("  restored:", dump)
+  assert(not dump:find("| 0 m |"), "expected restored non-zero distance")
+  if app2.on_close then guarded(BUDGET, app2.on_close) end
+end
+
+scenarios.trip_reset = function()
+  -- Reset button clears distance, time, home bearing, min altitude
+  cfg = { w = 240, h = 276, caps = { touch = true, keyboard = false, sdk_ext = true } }
+  local step = 0
+  cfg.gps = function()
+    step = step + 1
+    return { lat = 37.75 + step * 0.001, lon = -122.45, sats = 6, alt_m = 50, speed_kmh = 20.0 }
+  end
+  storekv = {}; wada = build_wada()
+  local app = load_app()
+  guarded(BUDGET, app.on_open, cfg.w, cfg.h)
+  buttons[1].fn(); tick(app, 10)   -- accumulate distance
+  buttons[2].fn(); tick(app, 1)    -- Reset
+  local dump = label_dump()
+  print("  after reset:", dump)
+  assert(dump:find("0:00"), "expected zero time after reset")
+  assert(dump:find("| 0 m |") or dump:find("0.00"), "expected zero distance after reset")
+  assert(dump:find("| -- |") or dump:find("--"), "expected no home after reset")
+  if app.on_close then guarded(BUDGET, app.on_close) end
+end
+
+scenarios.trip_cost = function()
+  cfg = { w = 240, h = 276, caps = { touch = true, keyboard = false, sdk_ext = true } }
+  local step = 0
+  cfg.gps = function()
+    step = step + 1
+    return { lat = 37.75 + step * 0.0001, lon = -122.45, sats = 8, alt_m = 42, speed_kmh = 10.0 }
+  end
+  storekv = {}; wada = build_wada()
+  local app = load_app()
+  assert(guarded(BUDGET, app.on_open, cfg.w, cfg.h))
+  buttons[1].fn()  -- start tracking so haversine + bearing run each tick
+  local worst = 0
+  for i = 1, 100 do
+    local n = 0
+    debug.sethook(function() n = n + 1000 end, "", 1000)
+    clock_ms = clock_ms + 2000
+    local ok, err = pcall(app.on_tick, 2000)
+    debug.sethook()
+    assert(ok, err)
+    if n > worst then worst = n end
+  end
+  print(string.format("  worst tick ~%d instructions (budget %d)", worst, BUDGET))
+  assert(worst < BUDGET / 4, "tick too expensive: " .. worst .. " > " .. BUDGET / 4)
+  if app.on_close then guarded(BUDGET, app.on_close) end
+end
+
+-- ---- Trip Odometer scenarios end ---------------------------------------------
+
 local order = APP_PATH:find("/sdscan/", 1, true)
   and { "sdscan_real_m9", "sdscan_many", "sdscan_m9", "sdscan_layouts", "sdscan_paging_and_full", "sdscan_old_firmware", "sdscan_no_access",
         "sdscan_no_card", "sdscan_remove_fails", "sdscan_portrait", "sdscan_cost" }
@@ -1872,6 +2137,10 @@ local order = APP_PATH:find("/sdscan/", 1, true)
   and { "protreck_tdeck", "protreck_v4", "protreck_no_gps", "protreck_chrono", "protreck_timer", "protreck_alti", "protreck_alarm", "protreck_cost" }
   or APP_PATH:find("/ping/", 1, true)
   and { "ping_tdeck", "ping_v4", "ping_no_contacts", "ping_round_trip", "ping_auto_reply", "ping_cost" }
+  or APP_PATH:find("/mapfetch/", 1, true)
+  and { "mapfetch_tdeck", "mapfetch_no_map", "mapfetch_no_gps", "mapfetch_swipe", "mapfetch_logic", "mapfetch_done", "mapfetch_cost" }
+  or APP_PATH:find("/tripodometer/", 1, true)
+  and { "trip_v4", "trip_tdeck", "trip_moving", "trip_persist", "trip_reset", "trip_cost" }
   or { "declination", "align_nofix", "bearings_absolute", "m9", "r8", "v4", "pager", "pager_portrait_jumbo", "tanmatsu", "audio_api", "cost" }
 for _, name in ipairs(order) do
   if SCENARIO == "all" or SCENARIO == name then

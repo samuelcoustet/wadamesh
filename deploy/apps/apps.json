@@ -31,6 +31,13 @@
       "desc": "Outdoor watch: sunrise/sunset + moon phase (ASTRO), chronometer with laps (CHRONO), countdown timer with alarm (TIMER), altimeter with trend graph (ALTI). Swipe left/right to switch modes. Contributed by samuelcoustet."
     },
     {
+      "id": "tripodometer",
+      "name": "Trip Odometer",
+      "ver": "1.0",
+      "desc": "GPS trip computer: distance, elapsed time, avg/max speed, min/current altitude, return-to-home bearing. Start/Stop to track, Reset to clear. Saves trip across restarts. Contributed by samuelcoustet.",
+      "requires": "gps"
+    },
+    {
       "id": "sdktest",
       "name": "SDK Test",
       "ver": "1.7",
@@ -54,6 +61,13 @@
       "name": "Nearby",
       "ver": "1.0",
       "desc": "Your contacts on a real map, sorted by distance, with bearing and a live frame counter. Reference app for wada.map, wada.ui.list, wada.geo and app.on_packet.",
+      "requires": "sdk_ext"
+    },
+    {
+      "id": "mapfetch",
+      "name": "MapFetch",
+      "ver": "1.0",
+      "desc": "Pre-caches offline map tiles for a zone while on Wi-Fi. Swipe up/down for radius (2/5/10/20 km), swipe left/right for max zoom (z12-z15), tap to start. Needs GPS fix and Wi-Fi. Contributed by samuelcoustet.",
       "requires": "sdk_ext"
     },
     {
