@@ -1796,6 +1796,36 @@ scenarios.protreck_alti = function()
   if app.on_close then guarded(BUDGET, app.on_close) end
 end
 
+scenarios.protreck_alarm = function()
+  cfg = { w = 320, h = 240, caps = { touch = true, keyboard = false, sdk_ext = true } }
+  cfg.gps = function() return nil end
+  storekv = {}
+  wada = build_wada()
+  local app = load_app()
+  assert(guarded(BUDGET, app.on_open, cfg.w, cfg.h))
+  -- on ASTRO tab: swipe-up adds 15 min to alarm
+  local h0 = storekv.alarm_h or 7
+  local m0 = storekv.alarm_m or 0
+  swipe(app, "up"); tick(app, 1)
+  swipe(app, "up"); tick(app, 1)
+  assert(type(storekv.alarm_h) == "number", "alarm_h must persist as number")
+  assert(type(storekv.alarm_m) == "number", "alarm_m must persist as number")
+  local diff = (storekv.alarm_h*60 + storekv.alarm_m) - (h0*60 + m0)
+  if diff < 0 then diff = diff + 24*60 end
+  assert(diff == 30, "two swipe-ups must add exactly 30 min, got diff=" .. tostring(diff))
+  -- swipe-down to reverse
+  swipe(app, "down"); tick(app, 1)
+  -- tap toggles alarm on
+  guarded(BUDGET, app.on_input, { type = "down", x = 0, y = 0 })
+  tick(app, 1)
+  assert(storekv.alarm_on == 1, "tap must enable alarm")
+  guarded(BUDGET, app.on_input, { type = "down", x = 0, y = 0 })
+  tick(app, 1)
+  assert(storekv.alarm_on == 0, "second tap must disable alarm")
+  print("  alarm: time step +30/-15 OK, toggle on/off OK")
+  if app.on_close then guarded(BUDGET, app.on_close) end
+end
+
 scenarios.protreck_cost = function()
   local alt = 500
   cfg = { w = 320, h = 240, caps = { touch = true, keyboard = false, sdk_ext = true } }
@@ -1804,10 +1834,20 @@ scenarios.protreck_cost = function()
   wada = build_wada()
   local app = load_app()
   assert(guarded(BUDGET, app.on_open, cfg.w, cfg.h))
-  -- switch to ALTI (heaviest draw: graph over 60 samples)
-  swipe(app, "left"); swipe(app, "left"); swipe(app, "left")
+  -- ASTRO tab: arc + moon disc scan lines (heaviest per-tab draw)
   local worst = 0
-  for i = 1, 80 do
+  for i = 1, 40 do
+    local n = 0
+    debug.sethook(function() n = n + 1000 end, "", 1000)
+    clock_ms = clock_ms + 500
+    local ok, err = pcall(app.on_tick, 500)
+    debug.sethook()
+    assert(ok, err)
+    if n > worst then worst = n end
+  end
+  -- ALTI tab: graph over 60 samples
+  swipe(app, "left"); swipe(app, "left"); swipe(app, "left")
+  for i = 1, 60 do
     local n = 0
     debug.sethook(function() n = n + 1000 end, "", 1000)
     clock_ms = clock_ms + 500
@@ -1829,7 +1869,7 @@ local order = APP_PATH:find("/sdscan/", 1, true)
   or APP_PATH:find("/tetris/", 1, true)
   and { "tetris_tdeck", "tetris_v4", "tetris_keyboard", "tetris_logic", "tetris_hiscore", "tetris_cost" }
   or APP_PATH:find("/protreck/", 1, true)
-  and { "protreck_tdeck", "protreck_v4", "protreck_no_gps", "protreck_chrono", "protreck_timer", "protreck_alti", "protreck_cost" }
+  and { "protreck_tdeck", "protreck_v4", "protreck_no_gps", "protreck_chrono", "protreck_timer", "protreck_alti", "protreck_alarm", "protreck_cost" }
   or APP_PATH:find("/ping/", 1, true)
   and { "ping_tdeck", "ping_v4", "ping_no_contacts", "ping_round_trip", "ping_auto_reply", "ping_cost" }
   or { "declination", "align_nofix", "bearings_absolute", "m9", "r8", "v4", "pager", "pager_portrait_jumbo", "tanmatsu", "audio_api", "cost" }

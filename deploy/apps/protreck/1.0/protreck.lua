@@ -1,9 +1,11 @@
--- ProTreck — wadamesh outdoor watch: Astro · Chrono · Timer · Altimeter
+-- ProTreck 1.1 — wadamesh outdoor watch
+-- Tabs: ASTRO · CHRONO · TIMER · ALTI
+-- ASTRO  : UTC clock, alarm (tap on/off, swipe-up/down +/-15 min), sun arc,
+--          moon phase disc + rise/set approximation, sunrise/sunset
+-- CHRONO : tap start/stop, swipe-up lap, swipe-down reset
+-- TIMER  : tap start/stop, swipe-up cycle preset, swipe-down reset
+-- ALTI   : GPS alt + trend graph; swipe-down resets min/max
 -- Swipe left/right to change tab
--- ASTRO: sunrise/sunset + moon phase from GPS fix
--- CHRONO: tap start/stop, swipe-up lap, swipe-down reset
--- TIMER: tap start/stop, swipe-up cycle preset, swipe-down reset
--- ALTI: GPS altitude with min/max and trend graph; swipe-down resets min/max
 -- Contributed by samuelcoustet
 
 local ui, sys, store, tmr = wada.ui, wada.sys, wada.store, wada.timer
@@ -12,40 +14,17 @@ local C = ui.colors
 local app = {}
 
 -- ── Constants ─────────────────────────────────────────────────────────────
-local TAB = { "ASTRO", "CHRONO", "TIMER", "ALTI" }
-local TAB_H  = 18    -- tab bar height (px)
-local HIST_N = 60    -- altimeter ring-buffer size
+local TAB   = { "ASTRO", "CHRONO", "TIMER", "ALTI" }
+local TAB_H = 18
+local HIST_N = 60
 
--- ── State ─────────────────────────────────────────────────────────────────
+-- ── Shared display state ───────────────────────────────────────────────────
 local tab = 1
 local cv, W, H
 
--- Astro
-local astro_t0    = 0     -- last refresh (millis)
-local astro_sr, astro_ss  -- sunrise / sunset (UTC fractional hours), or nil
-local astro_phase = 0     -- moon phase 0-29
-local astro_lat, astro_lon, astro_yday, astro_year
-
--- Chrono
-local chr_run    = false
-local chr_t0     = 0     -- millis at last start
-local chr_acc    = 0     -- accumulated ms before last start
-local chr_laps   = {}    -- list of "MM:SS.cs" strings
-
--- Timer
-local TMR_PRESETS = { 30, 60, 120, 300, 600, 1800, 3600 }
-local tmr_pi     = 4     -- preset index (default 300 s)
-local tmr_secs   = 300
-local tmr_end    = 0     -- millis when alarm fires; 0 = not running
-local tmr_done   = false
-
--- Altimeter
-local alti_min   = 99999
-local alti_max   = -99999
-local alti_hist  = {}
-local alti_hi    = 0     -- ring-buffer write head
-
 -- ── Time helpers ──────────────────────────────────────────────────────────
+local PI = math.pi
+
 local function now_unix()
   local ep = sys.epoch and sys.epoch()
   if ep then return ep end
@@ -55,19 +34,17 @@ end
 
 local function decompose(t)
   if os and os.date then return os.date("*t", t) end
-  -- minimal fallback (good enough for rough yday on harness without os.date)
-  local s = t % 86400
-  local sec  = s % 60;            s = math.floor(s / 60)
-  local min2 = s % 60;            local hr = math.floor(s / 60)
+  local s    = t % 86400
+  local sec  = s % 60;  s = math.floor(s / 60)
+  local min2 = s % 60;  local hr = math.floor(s / 60)
   local days = math.floor(t / 86400)
-  -- Gregorian: days since epoch 1970-01-01
   local y = 1970; local d = days
   while true do
-    local ylen = ((y % 4 == 0 and y % 100 ~= 0) or y % 400 == 0) and 366 or 365
-    if d < ylen then break end
-    d = d - ylen; y = y + 1
+    local yl = ((y%4==0 and y%100~=0) or y%400==0) and 366 or 365
+    if d < yl then break end
+    d = d - yl; y = y + 1
   end
-  return { year = y, hour = hr, min = min2, sec = sec, yday = d + 1 }
+  return { year=y, month=1, day=1, hour=hr, min=min2, sec=sec, yday=d+1 }
 end
 
 local function fmt_hms(ms)
@@ -75,11 +52,8 @@ local function fmt_hms(ms)
   local cs = math.floor((ms % 1000) / 10)
   local m  = math.floor(s / 60); s = s % 60
   local h  = math.floor(m / 60); m = m % 60
-  if h > 0 then
-    return string.format("%d:%02d:%02d", h, m, s)
-  else
-    return string.format("%02d:%02d.%02d", m, s, cs)
-  end
+  if h > 0 then return string.format("%d:%02d:%02d",    h, m, s)
+            else return string.format("%02d:%02d.%02d", m, s, cs) end
 end
 
 local function fmt_mm_ss(secs)
@@ -90,31 +64,45 @@ local function fmt_mm_ss(secs)
   return string.format("%02d:%02d", m, s)
 end
 
--- ── Sun / moon algorithms ─────────────────────────────────────────────────
-local PI  = math.pi
-local RAD = PI / 180
+local function fmt_utch(fh)
+  -- fractional UTC hour → "HH:MM"
+  if not fh then return "--:--" end
+  local h = math.floor(fh) % 24
+  local m = math.floor((fh - math.floor(fh)) * 60 + 0.5)
+  if m >= 60 then h = (h+1)%24; m = 0 end
+  return string.format("%02d:%02d", h, m)
+end
 
+-- ── Astronomical algorithms ────────────────────────────────────────────────
 local function sun_utc(lat, lon, yday)
-  -- Spencer 1971 simplified; returns rise_utc, set_utc (fractional hours) or nil,nil
-  local B    = RAD * (360 / 365) * (yday - 81)
-  local eqt  = 9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)  -- minutes
-  local decl = RAD * 23.45 * math.sin(B)
-  local cha  = -math.tan(lat * RAD) * math.tan(decl)
+  -- Spencer 1971 simplified; returns rise_utc, set_utc (fractional hours)
+  local B    = PI / 180 * (360 / 365) * (yday - 81)
+  local eqt  = 9.87*math.sin(2*B) - 7.53*math.cos(B) - 1.5*math.sin(B)
+  local decl = PI / 180 * 23.45 * math.sin(B)
+  local cha  = -math.tan(lat * PI/180) * math.tan(decl)
   if cha < -1 or cha > 1 then return nil, nil end
-  local ha   = math.acos(cha) / RAD  -- degrees
-  local noon = 12 - lon / 15 - eqt / 60
-  return noon - ha / 15, noon + ha / 15
+  local ha   = math.acos(cha) / (PI/180)
+  local noon = 12 - lon/15 - eqt/60
+  return noon - ha/15, noon + ha/15
 end
 
 local function moon_phase_num(t)
-  -- days since known new moon 2000-01-06 (JD 2451549.5) → phase 0-29
-  local days = t / 86400 - 10957  -- 10957 = days from 1970-01-01 to 2000-01-01
-  local cycle = 29.53058867
-  return math.floor((days - 6.0) % cycle)
+  -- phase 0-29 from Unix timestamp
+  local days = t / 86400 - 10957
+  return math.floor((days - 6.0) % 29.53058867)
+end
+
+local function moonrise_set(phase, sr, ss)
+  -- rough approximation: moon rises ~50 min later each day than the day before
+  -- at new moon rises with sun; at full moon rises at sunset
+  local base = sr or 6.0
+  local rise = (base + phase * 24 / 29.5) % 24
+  local set2 = (rise + 12.4) % 24
+  return rise, set2
 end
 
 local MOON_NAMES = {
-  [0]="New Moon", [1]="New Moon",
+  [0]="New",[1]="New",
   [2]="Waxing Crescent",[3]="Waxing Crescent",[4]="Waxing Crescent",
   [5]="Waxing Crescent",[6]="Waxing Crescent",[7]="Waxing Crescent",
   [8]="First Quarter",[9]="First Quarter",
@@ -125,151 +113,238 @@ local MOON_NAMES = {
   [20]="Waning Gibbous",[21]="Waning Gibbous",
   [22]="Last Quarter",[23]="Last Quarter",
   [24]="Waning Crescent",[25]="Waning Crescent",[26]="Waning Crescent",
-  [27]="Waning Crescent",[28]="Waning Crescent",[29]="New Moon",
+  [27]="Waning Crescent",[28]="Waning Crescent",[29]="New",
 }
+
+-- ── Astro state ────────────────────────────────────────────────────────────
+local astro_t0    = 0
+local astro_sr, astro_ss           -- sunrise/sunset UTC fractional hours
+local astro_mr, astro_ms           -- moonrise/moonset UTC fractional hours
+local astro_phase = 0
+local astro_lat, astro_lon
 
 local function update_astro()
   local now = sys.millis()
   if now - astro_t0 < 60000 then return end
   astro_t0 = now
-  local t = now_unix()
+  local t   = now_unix()
   local gps = sys.gps()
   if gps and t then
-    local d = decompose(t)
+    local d    = decompose(t)
     astro_lat  = gps.lat
     astro_lon  = gps.lon
-    astro_yday = d.yday or 182
-    astro_year = d.year or 2024
-    astro_sr, astro_ss = sun_utc(gps.lat, gps.lon, astro_yday)
-    astro_phase = moon_phase_num(t)
+    local yday = d.yday or 182
+    astro_sr, astro_ss = sun_utc(gps.lat, gps.lon, yday)
+    astro_phase        = moon_phase_num(t)
+    astro_mr, astro_ms = moonrise_set(astro_phase, astro_sr, astro_ss)
   end
 end
 
--- ── Draw helpers ──────────────────────────────────────────────────────────
-local function tx(x)   return math.floor(x) end
-local function ty(y)   return math.floor(y) end
+-- ── Alarm state ────────────────────────────────────────────────────────────
+local alarm_h    = 7
+local alarm_m    = 0
+local alarm_on   = 0   -- 0=off, 1=on
+local alarm_fire = false
 
-local function label(x, y, s, col, sz)
-  cv:text(tx(x), ty(y), tostring(s), col, sz)
+local function alarm_step(delta_min)
+  local total = alarm_h * 60 + alarm_m + delta_min
+  total = total % (24 * 60)
+  if total < 0 then total = total + 24 * 60 end
+  alarm_h = math.floor(total / 60)
+  alarm_m = total % 60
+  store.set("alarm_h", alarm_h)
+  store.set("alarm_m", alarm_m)
 end
 
-local function head(x, y, s, col)
-  label(x, y, s, col or C.sub, 11)
+-- ── Sun arc diagram ────────────────────────────────────────────────────────
+local function draw_sun_arc(cx, hy, r, cur_h)
+  -- arc dots (22 points along the upper semicircle)
+  for step = 0, 22 do
+    local a  = PI - step / 22 * PI
+    local ax = math.floor(cx + (r + 3) * math.cos(a))
+    local ay = math.floor(hy - (r + 3) * math.sin(a))
+    cv:rect(ax, ay, 2, 2, 0x243040, true, 0)
+  end
+  -- horizon line
+  cv:rect(cx - r - 8, hy, r * 2 + 16, 1, C.sub, true, 0)
+
+  if astro_sr and astro_ss then
+    -- rise and set tick marks
+    cv:rect(cx - r - 3, hy - 6, 1, 12, C.good, true, 0)
+    cv:rect(cx + r + 2, hy - 6, 1, 12, C.bad,  true, 0)
+    -- sun position
+    if cur_h and cur_h >= astro_sr and cur_h <= astro_ss then
+      local prog = (cur_h - astro_sr) / (astro_ss - astro_sr)
+      local a  = PI - prog * PI
+      local sx = math.floor(cx + r * math.cos(a))
+      local sy = math.floor(hy - r * math.sin(a))
+      cv:circle(sx, sy, 5, 0xffcc00, true, 0)
+      cv:circle(sx, sy, 5, 0xff9900, false, 1)
+    else
+      -- below horizon
+      cv:circle(cx, hy + 9, 4, 0x334455, true, 0)
+    end
+  else
+    -- no fix / polar: show neutral disc
+    cv:circle(cx, hy - r / 2, 4, 0x445566, true, 0)
+  end
 end
 
-local function big(x, y, s, col, sz)
-  label(x, y, s, col or C.text, sz or 24)
-  return #s * (sz and math.floor(sz * 0.6) or 14)  -- rough width estimate
+-- ── Moon phase disc (scan-line, exact terminator) ─────────────────────────
+local function draw_moon_disc(cx, cy, r, phase)
+  local phi    = phase / 29.5 * 2 * PI
+  local drk    = 0x1a2433
+  local lit    = 0xdde8f8
+
+  for yi = -r, r - 1, 2 do
+    local chord = math.floor(math.sqrt(r * r - yi * yi) + 0.5)
+    if chord > 0 then
+      -- full dark row
+      cv:rect(cx - chord, cy + yi, chord * 2, 2, drk, true, 0)
+      -- terminator x = cos(phi) * chord
+      local term = math.floor(math.cos(phi) * chord + 0.5)
+      local lx, lw
+      if phi <= PI then
+        -- waxing: lit is right of terminator
+        lx = cx + term; lw = chord - term
+      else
+        -- waning: lit is left of -term (= right of term mirrored)
+        lx = cx - chord; lw = chord - term
+      end
+      if lw > 0 then
+        cv:rect(lx, cy + yi, lw, 2, lit, true, 0)
+      end
+    end
+  end
+  cv:circle(cx, cy, r, 0x4a5f70, false, 1)
 end
 
 -- ── ASTRO tab ─────────────────────────────────────────────────────────────
 local function draw_astro(cw, ch)
-  local t = now_unix()
-  local d = t and decompose(t) or nil
+  local t    = now_unix()
+  local d    = t and decompose(t) or nil
+  local cur_h = d and (d.hour + d.min/60 + d.sec/3600) or nil
 
-  -- Date header
+  -- right-column geometry
+  local col_w = math.floor(cw / 2)
+  local cx_r  = math.floor(cw * 3 / 4)
+  local arc_r = math.min(36, math.floor(col_w * 0.44))
+  local moo_r = math.min(18, math.floor(col_w * 0.22))
+  -- y anchors
+  local ARC_Y = 72       -- sun arc horizon baseline
+  local MOO_Y = 160      -- moon disc centre
+
+  -- ── Clock ───────────────────────────────────────────────────────────────
   if d then
+    local clk = string.format("%02d:%02d:%02d", d.hour or 0, d.min or 0, d.sec or 0)
+    cv:text(4, 2, clk, C.text, 20)
     local ds = string.format("%04d-%02d-%02d", d.year or 0, d.month or 0, d.day or 0)
-    head(4, 4, ds, C.sub)
-    local ts2 = string.format("%02d:%02d:%02d UTC", d.hour or 0, d.min or 0, d.sec or 0)
-    head(cw - tx(#ts2 * 6 + 4), 4, ts2, C.sub)
+    cv:text(4, 24, ds, C.sub, 11)
+  else
+    cv:text(4, 2, "--:--:--", C.sub, 20)
   end
 
-  local y = 22
-  -- Sun section
-  cv:rect(4, y, cw - 8, 1, C.sub, true, 0)
-  y = y + 6
-  head(4, y, "SUN", C.accent)
-  y = y + 14
+  -- ── Alarm ───────────────────────────────────────────────────────────────
+  local alm_s = string.format("%02d:%02d", alarm_h, alarm_m)
+  local alm_col = alarm_on == 1 and C.good or C.sub
+  local ax0 = cw - math.floor(#alm_s * 10 + 26)
+  cv:text(ax0, 2, alm_s, alm_col, 16)
+  -- on/off dot
+  local dot_x = ax0 + math.floor(#alm_s * 10 + 4)
+  cv:circle(dot_x, 10, 4, alarm_on == 1 and C.good or 0x334455, true, 0)
+  cv:text(ax0 - 22, 4, "AL", C.sub, 11)
+
+  local sep_y = 40
+  cv:rect(0, sep_y, cw, 1, 0x1e2a38, true, 0)
+
+  -- ── Sun section (left) ──────────────────────────────────────────────────
+  local SY = sep_y + 6
+  cv:text(4, SY, "SUN", C.accent, 11)
   if astro_sr then
-    local rh = math.floor(astro_sr)
-    local rm = math.floor((astro_sr - rh) * 60 + 0.5)
-    local sh = math.floor(astro_ss)
-    local sm = math.floor((astro_ss - sh) * 60 + 0.5)
-    label(8,       y, string.format("Rise  %02d:%02d", rh, rm), C.text, 13)
-    label(8,  y + 16, string.format("Set   %02d:%02d", sh, sm), C.text, 13)
+    cv:text(4, SY+14, "Rise  " .. fmt_utch(astro_sr), C.text, 12)
+    cv:text(4, SY+28, "Set   " .. fmt_utch(astro_ss), C.text, 12)
   elseif astro_lat then
-    label(8, y, "Polar day / night", C.sub, 12)
-    y = y - 16
+    cv:text(4, SY+14, "Polar", C.sub, 12)
   else
-    label(8, y, "Need GPS fix", C.bad, 12)
-    y = y - 16
+    cv:text(4, SY+14, "No GPS", C.bad, 12)
   end
 
-  y = y + 40
-  -- Moon section
-  cv:rect(4, y, cw - 8, 1, C.sub, true, 0)
-  y = y + 6
-  head(4, y, "MOON", C.accent)
-  y = y + 14
+  -- ── Sun arc (right) ─────────────────────────────────────────────────────
+  draw_sun_arc(cx_r, ARC_Y, arc_r, cur_h)
+  -- small rise/set times under arc
+  if astro_sr and astro_ss then
+    cv:text(cx_r - arc_r - 6, ARC_Y + 4, fmt_utch(astro_sr), C.good, 9)
+    cv:text(cx_r + arc_r - 16, ARC_Y + 4, fmt_utch(astro_ss), C.bad, 9)
+  end
+
+  local sep2_y = ARC_Y + 20
+  cv:rect(0, sep2_y, cw, 1, 0x1e2a38, true, 0)
+
+  -- ── Moon section (left) ─────────────────────────────────────────────────
+  local MY = sep2_y + 6
+  cv:text(4, MY, "MOON", C.accent, 11)
   if astro_lat and t then
-    local name = MOON_NAMES[astro_phase] or "?"
-    label(8, y,      string.format("Phase %d / 29", astro_phase), C.text, 13)
-    label(8, y + 16, name, C.sub, 12)
-    -- draw a simple moon disc glyph (filled = new/full, half = quarters)
-    local mx = math.floor(cw * 3 / 4)
-    local my = ty(y + 8)
-    local r  = 10
-    cv:circle(mx, my, r, C.sub, false, 1)
-    if astro_phase < 3 or astro_phase > 27 then
-      cv:circle(mx, my, r - 2, C.sub, true, 0)        -- new moon: dark
-    elseif astro_phase < 15 then
-      cv:circle(mx, my, r - 2, C.accent, true, 0)     -- waxing: right half lit
-    elseif astro_phase < 17 then
-      cv:circle(mx, my, r - 2, C.good, true, 0)       -- full moon
-    else
-      cv:circle(mx, my, r - 2, C.accent, true, 0)     -- waning: left half lit
-    end
+    local mname = MOON_NAMES[astro_phase] or "?"
+    cv:text(4, MY+14, mname,                        C.text, 12)
+    cv:text(4, MY+28, "Phase " .. astro_phase .. "/29", C.sub,  11)
+    cv:text(4, MY+42, "Rise  " .. fmt_utch(astro_mr), C.sub, 11)
+    cv:text(4, MY+54, "Set   " .. fmt_utch(astro_ms), C.sub, 11)
   else
-    label(8, y, "Need GPS + time", C.bad, 12)
+    cv:text(4, MY+14, "No GPS+time", C.bad, 12)
   end
 
-  -- GPS status row at bottom
+  -- ── Moon disc (right) ───────────────────────────────────────────────────
+  draw_moon_disc(cx_r, MOO_Y, moo_r, astro_phase)
+
+  -- ── GPS footer ──────────────────────────────────────────────────────────
   local gps = sys.gps()
+  local gy  = ch - 14
   if gps then
-    label(4, ch - 16, string.format("GPS %d sats  %.4f,%.4f", gps.sats, gps.lat, gps.lon), C.sub, 10)
+    cv:text(4, gy, string.format("GPS %d  %.3f,%.3f", gps.sats, gps.lat, gps.lon), C.sub, 10)
   else
-    label(4, ch - 16, "GPS: no fix", C.bad, 10)
+    cv:text(4, gy, "GPS: no fix", C.bad, 10)
   end
 end
 
 -- ── CHRONO tab ────────────────────────────────────────────────────────────
+local chr_run = false
+local chr_t0  = 0
+local chr_acc = 0
+local chr_laps = {}
+
 local function chr_elapsed()
-  if chr_run then
-    return chr_acc + (sys.millis() - chr_t0)
-  else
-    return chr_acc
-  end
+  if chr_run then return chr_acc + (sys.millis() - chr_t0) end
+  return chr_acc
 end
 
 local function draw_chrono(cw, ch)
   local ms  = chr_elapsed()
   local ts  = fmt_hms(ms)
-  -- big time
-  local tw  = tx(#ts * 14)
-  local tx2 = math.max(4, math.floor((cw - tw) / 2))
-  cv:text(tx2, 20, ts, chr_run and C.good or C.text, 22)
+  local tw  = math.floor(#ts * 14)
+  cv:text(math.max(4, math.floor((cw - tw) / 2)), 20, ts, chr_run and C.good or C.text, 22)
 
-  -- status
   local stat = chr_run and "RUNNING" or (chr_acc > 0 and "STOPPED" or "READY")
-  head(math.floor((cw - #stat * 6) / 2), 52, stat, chr_run and C.good or C.sub)
+  cv:text(math.floor((cw - #stat * 6) / 2), 52, stat, chr_run and C.good or C.sub, 11)
+  cv:text(4, 66, "tap: start/stop   up: lap   down: reset", C.sub, 11)
 
-  -- hints
-  head(4, 66, "tap: start/stop   up: lap   down: reset", C.sub)
-
-  -- lap list (last 6)
-  local start_lap = math.max(1, #chr_laps - 5)
+  local start_i = math.max(1, #chr_laps - 5)
   local ly = 84
-  for i = start_lap, #chr_laps do
+  for i = start_i, #chr_laps do
     local col = i == #chr_laps and C.text or C.sub
-    label(4,  ly, string.format("Lap %d", i), col, 12)
-    label(44, ly, chr_laps[i],                col, 12)
+    cv:text(4,  ly, string.format("Lap %d", i), col, 12)
+    cv:text(44, ly, chr_laps[i],                col, 12)
     ly = ly + 14
     if ly > ch - 20 then break end
   end
 end
 
 -- ── TIMER tab ─────────────────────────────────────────────────────────────
+local TMR_PRESETS = { 30, 60, 120, 300, 600, 1800, 3600 }
+local tmr_pi    = 4
+local tmr_secs  = 300
+local tmr_end   = 0
+local tmr_done  = false
+
 local function tmr_remaining()
   if tmr_end == 0 then return tmr_secs * 1000 end
   local r = tmr_end - sys.millis()
@@ -278,110 +353,94 @@ end
 
 local function draw_timer(cw, ch)
   local rem  = tmr_remaining()
-  local secs = math.floor(rem / 1000)
-  local ts   = fmt_mm_ss(secs)
+  local ts   = fmt_mm_ss(math.floor(rem / 1000))
   local col  = tmr_done and C.bad or (tmr_end ~= 0 and C.good or C.text)
-  local tw   = tx(#ts * 16)
-  local tx2  = math.max(4, math.floor((cw - tw) / 2))
-  cv:text(tx2, 20, ts, col, 26)
+  local tw   = math.floor(#ts * 16)
+  cv:text(math.max(4, math.floor((cw - tw) / 2)), 20, ts, col, 26)
 
-  -- progress bar
   local total_ms = tmr_secs * 1000
-  local pct = (total_ms > 0) and math.floor((total_ms - rem) * (cw - 8) / total_ms) or 0
-  if pct > 0 then
-    cv:rect(4, 58, pct, 4, tmr_done and C.bad or C.accent, true, 0)
-  end
+  local pct = total_ms > 0 and math.floor((total_ms - rem) * (cw - 8) / total_ms) or 0
+  if pct > 0 then cv:rect(4, 58, pct, 4, tmr_done and C.bad or C.accent, true, 0) end
   cv:rect(4, 58, cw - 8, 4, 0x1a1f26, false, 0)
 
-  -- preset
-  local pre_s = string.format("Preset: %s", fmt_mm_ss(tmr_secs))
-  head(4, 70, pre_s, C.sub)
-  head(4, 84, "tap: start/stop   up: cycle preset   down: reset", C.sub)
+  cv:text(4, 70, "Preset: " .. fmt_mm_ss(tmr_secs), C.sub, 11)
+  cv:text(4, 84, "tap: start/stop   up: preset   down: reset", C.sub, 11)
 
   if tmr_done then
     local ax = math.floor((cw - 60) / 2)
     cv:rect(ax, 100, 60, 22, 0x1a1f26, true, 4)
-    label(ax + 8, 104, "ALARM!", C.bad, 16)
+    cv:text(ax + 8, 104, "ALARM!", C.bad, 16)
   end
 end
 
 -- ── ALTI tab ──────────────────────────────────────────────────────────────
+local alti_min  = 99999
+local alti_max  = -99999
+local alti_hist = {}
+
 local function draw_alti(cw, ch)
   local gps = sys.gps()
   local alt = gps and gps.alt_m or nil
-
-  -- big altitude
   local ats = alt and string.format("%d m", math.floor(alt)) or "--- m"
-  local tw  = tx(#ats * 14)
-  cv:text(math.max(4, math.floor((cw - tw) / 2)), 10, ats,
-          alt and C.text or C.sub, 24)
+  local tw  = math.floor(#ats * 14)
+  cv:text(math.max(4, math.floor((cw - tw) / 2)), 10, ats, alt and C.text or C.sub, 24)
 
-  -- min / max
   local mn_s = alti_min < 99999 and string.format("%d m", math.floor(alti_min)) or "---"
   local mx_s = alti_max > -99999 and string.format("%d m", math.floor(alti_max)) or "---"
-  head(4, 44, "MIN")
-  label(4, 56, mn_s, C.sub, 13)
-  head(math.floor(cw / 2) + 4, 44, "MAX")
-  label(math.floor(cw / 2) + 4, 56, mx_s, C.sub, 13)
+  cv:text(4, 44, "MIN", C.sub, 11)
+  cv:text(4, 56, mn_s, C.sub, 13)
+  cv:text(math.floor(cw/2)+4, 44, "MAX", C.sub, 11)
+  cv:text(math.floor(cw/2)+4, 56, mx_s, C.sub, 13)
 
-  -- GPS info
   if gps then
-    label(4, 76, string.format("Sats %d   %d km/h", gps.sats, math.floor(gps.speed_kmh or 0)),
-          gps.sats >= 4 and C.good or C.bad, 11)
+    cv:text(4, 76, string.format("Sats %d   %d km/h", gps.sats, math.floor(gps.speed_kmh or 0)),
+            gps.sats >= 4 and C.good or C.bad, 11)
   else
-    label(4, 76, "No GPS fix", C.bad, 11)
+    cv:text(4, 76, "No GPS fix", C.bad, 11)
   end
 
-  -- trend graph
   local n = #alti_hist
   if n > 2 then
     local gy = 92
     local gh = ch - gy - 20
     local gw = cw - 8
     cv:rect(4, gy, gw, gh, 0x1a1f26, true, 2)
-    -- find range
     local mn2, mx2 = alti_hist[1], alti_hist[1]
     for _, v in ipairs(alti_hist) do
       if v < mn2 then mn2 = v end
       if v > mx2 then mx2 = v end
     end
-    local rng = mx2 - mn2
-    if rng < 1 then rng = 1 end
-    -- draw line as series of small rects
+    local rng = mx2 - mn2; if rng < 1 then rng = 1 end
     for i = 2, n do
-      local x1 = math.floor(4 + (i - 2) * gw / (HIST_N - 1))
-      local x2 = math.floor(4 + (i - 1) * gw / (HIST_N - 1))
+      local x1 = math.floor(4 + (i-2) * gw / (HIST_N-1))
+      local x2 = math.floor(4 + (i-1) * gw / (HIST_N-1))
       local y1 = math.floor(gy + gh - (alti_hist[i-1] - mn2) * gh / rng)
       local y2 = math.floor(gy + gh - (alti_hist[i]   - mn2) * gh / rng)
-      local lx = math.min(x1, x2)
-      local lw = math.max(1, math.abs(x2 - x1))
-      local ly = math.min(y1, y2)
-      local lh = math.max(1, math.abs(y2 - y1))
+      local lx = math.min(x1,x2); local lw = math.max(1, math.abs(x2-x1))
+      local ly = math.min(y1,y2); local lh = math.max(1, math.abs(y2-y1))
       cv:rect(lx, ly, lw, lh, C.accent, true, 0)
     end
-    -- axis labels
-    head(6,  gy + 2,       math.floor(mx2) .. "m", C.sub)
-    head(6,  gy + gh - 12, math.floor(mn2) .. "m", C.sub)
+    cv:text(6, gy+2,       math.floor(mx2) .. "m", C.sub, 10)
+    cv:text(6, gy+gh-12,   math.floor(mn2) .. "m", C.sub, 10)
   end
-
-  head(4, ch - 14, "down: reset min/max", C.sub)
+  cv:text(4, ch-14, "down: reset min/max", C.sub, 10)
 end
 
 -- ── Tab bar ───────────────────────────────────────────────────────────────
 local function draw_tab_bar()
   local tw = math.floor(W / #TAB)
   for i, name in ipairs(TAB) do
-    local tx2 = (i - 1) * tw
+    local tx = (i-1) * tw
     if i == tab then
-      cv:rect(tx2, H - TAB_H, tw, TAB_H, C.accent, true, 0)
-      cv:text(math.floor(tx2 + (tw - #name * 6) / 2), H - TAB_H + 4, name, 0x000000, 10)
+      cv:rect(tx, H-TAB_H, tw, TAB_H, C.accent, true, 0)
+      cv:text(math.floor(tx + (tw - #name*6)/2), H-TAB_H+4, name, 0x000000, 10)
     else
-      cv:text(math.floor(tx2 + (tw - #name * 6) / 2), H - TAB_H + 4, name, C.sub, 10)
+      cv:text(math.floor(tx + (tw - #name*6)/2), H-TAB_H+4, name, C.sub, 10)
     end
   end
 end
 
--- ── Full redraw ───────────────────────────────────────────────────────────
+-- ── Main redraw ───────────────────────────────────────────────────────────
 local function redraw()
   if not cv then return end
   local ch = H - TAB_H
@@ -399,37 +458,53 @@ function app.on_open(w, h)
   W, H = w, h
   cv = ui.canvas(w, h)
   cv:pos(0, 0)
-  -- restore persistent state
-  alti_min  = tonumber(store.get("alti_min",   99999)) or 99999
-  alti_max  = tonumber(store.get("alti_max",  -99999)) or -99999
-  tmr_pi    = tonumber(store.get("tmr_pi",          4)) or 4
+  alti_min = tonumber(store.get("alti_min",   99999)) or 99999
+  alti_max = tonumber(store.get("alti_max",  -99999)) or -99999
+  tmr_pi   = tonumber(store.get("tmr_pi",         4)) or 4
   if tmr_pi < 1 or tmr_pi > #TMR_PRESETS then tmr_pi = 4 end
-  tmr_secs  = TMR_PRESETS[tmr_pi]
-  astro_t0  = 0   -- force an immediate astro refresh
+  tmr_secs = TMR_PRESETS[tmr_pi]
+  alarm_h  = tonumber(store.get("alarm_h",  7)) or 7
+  alarm_m  = tonumber(store.get("alarm_m",  0)) or 0
+  alarm_on = tonumber(store.get("alarm_on", 0)) or 0
+  astro_t0 = 0
   update_astro()
   redraw()
   tmr.every(500)
 end
 
 function app.on_tick(dt)
-  -- altimeter: sample GPS when on the alti tab
+  -- altimeter sampling
   if tab == 4 then
     local gps = sys.gps()
     if gps and gps.alt_m then
       local a = gps.alt_m
-      alti_hi = (alti_hi % HIST_N) + 1
-      alti_hist[alti_hi] = a
+      alti_hist[#alti_hist+1] = a
+      if #alti_hist > HIST_N then table.remove(alti_hist, 1) end
       if a < alti_min then alti_min = a; store.set("alti_min", alti_min) end
       if a > alti_max then alti_max = a; store.set("alti_max", alti_max) end
     end
   end
-  -- timer alarm
+  -- countdown timer alarm
   if tmr_end ~= 0 and not tmr_done and sys.millis() >= tmr_end then
-    tmr_done = true
-    tmr_end  = 0
+    tmr_done = true; tmr_end = 0
     sys.beep()
   end
-  -- astro refresh (throttled inside update_astro)
+  -- alarm clock check (requires real time)
+  if alarm_on == 1 then
+    local t = now_unix()
+    if t then
+      local d = decompose(t)
+      if d and d.hour == alarm_h and d.min == alarm_m then
+        if not alarm_fire then
+          alarm_fire = true
+          sys.beep()
+          sys.toast(string.format("Alarm %02d:%02d", alarm_h, alarm_m), 4000)
+        end
+      else
+        alarm_fire = false
+      end
+    end
+  end
   update_astro()
   redraw()
 end
@@ -442,8 +517,10 @@ function app.on_input(ev)
     elseif d == "right" then
       tab = ((tab - 2) % #TAB) + 1
     elseif d == "up" then
-      if tab == 2 and chr_run then
-        chr_laps[#chr_laps + 1] = fmt_hms(chr_elapsed())
+      if tab == 1 then
+        alarm_step(15)
+      elseif tab == 2 and chr_run then
+        chr_laps[#chr_laps+1] = fmt_hms(chr_elapsed())
         sys.toast("Lap " .. #chr_laps, 800)
       elseif tab == 3 then
         tmr_pi   = (tmr_pi % #TMR_PRESETS) + 1
@@ -452,35 +529,32 @@ function app.on_input(ev)
         tmr_end = 0; tmr_done = false
       end
     elseif d == "down" then
-      if tab == 2 then
-        chr_run  = false; chr_t0 = 0; chr_acc = 0; chr_laps = {}
+      if tab == 1 then
+        alarm_step(-15)
+      elseif tab == 2 then
+        chr_run = false; chr_t0 = 0; chr_acc = 0; chr_laps = {}
       elseif tab == 3 then
         tmr_end = 0; tmr_done = false
       elseif tab == 4 then
-        alti_min = 99999; alti_max = -99999; alti_hist = {}; alti_hi = 0
+        alti_min = 99999; alti_max = -99999; alti_hist = {}
         store.set("alti_min", alti_min); store.set("alti_max", alti_max)
         sys.toast("Alt min/max reset", 1000)
       end
     end
     redraw()
   elseif ev.type == "down" then
-    if tab == 2 then
-      if chr_run then
-        chr_acc = chr_elapsed(); chr_run = false
-      else
-        chr_t0 = sys.millis(); chr_run = true
-      end
-      redraw()
+    if tab == 1 then
+      alarm_on = alarm_on == 1 and 0 or 1
+      store.set("alarm_on", alarm_on)
+    elseif tab == 2 then
+      if chr_run then chr_acc = chr_elapsed(); chr_run = false
+      else            chr_t0 = sys.millis();    chr_run = true end
     elseif tab == 3 then
-      if tmr_end ~= 0 then
-        tmr_end = 0; tmr_done = false
-      elseif tmr_done then
-        tmr_done = false
-      else
-        tmr_end = sys.millis() + tmr_secs * 1000
-      end
-      redraw()
+      if tmr_end ~= 0 then        tmr_end = 0; tmr_done = false
+      elseif tmr_done then        tmr_done = false
+      else                        tmr_end = sys.millis() + tmr_secs * 1000 end
     end
+    redraw()
   end
 end
 
